@@ -14,7 +14,6 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
-
 import xgboost as xgb
 from xgboost import plot_importance
 
@@ -30,6 +29,9 @@ def calculate_rmse(y_true, y_pred):
 def calculate_mape(y_true, y_pred):
     y_true, y_pred = np.array(y_true), np.array(y_pred)
     non_zero_mask = y_true != 0
+    # Handle cases where all true values are zero
+    if not np.any(non_zero_mask):
+        return 0.0
     return np.mean(np.abs((y_true[non_zero_mask] - y_pred[non_zero_mask]) / y_true[non_zero_mask])) * 100
 
 
@@ -126,8 +128,6 @@ def preprocess_data(data_df):
     print(f"전처리 완료 - 최종 데이터 크기: {len(features)} 행")
     print(f"특징 데이터 형태: {features.shape}")
     print(f"타겟 데이터 형태: {targets.shape}")
-    
-
     
     return features, targets
 
@@ -257,7 +257,7 @@ class SolarPatternDataset(Dataset):
             self.y.append(targets[i+seq_len])
             self.patterns.append(patterns[i:i+seq_len])  # 패턴 시퀀스
 
-        self.X = np.array(self.X, dtype=np.float32)        # (N, seq_len, feature_dim)
+        self.X = np.array(self.X, dtype=np.float32)      # (N, seq_len, feature_dim)
         self.y = np.array(self.y, dtype=np.float32)
         self.patterns = np.array(self.patterns, dtype=np.int64)  # 정수로 저장
 
@@ -444,20 +444,31 @@ class CNN_LSTM_Pattern(nn.Module):
         return train_losses, val_losses
     
     def predict(self, test_loader):
-        """
-        모델 예측 함수
-        """
-        self.eval()
-        predictions = []
-        actuals = []
-        
-        with torch.no_grad():
-            for batch_X, batch_y in test_loader:
-                preds = self(batch_X)
-                predictions.extend(preds.cpu().numpy())
-                actuals.extend(batch_y.cpu().numpy())
-        
-        return np.array(predictions), np.array(actuals)
+            """
+            모델 예측 함수
+            """
+            self.eval()
+            predictions = []
+            actuals = []
+            
+            with torch.no_grad():
+                for batch_X, batch_y in test_loader:
+                    preds = self(batch_X)
+                    
+                    # Convert tensors to numpy arrays
+                    preds_np = preds.cpu().numpy()
+                    actuals_np = batch_y.cpu().numpy()
+                    
+                    # Ensure the numpy arrays are always at least 1-dimensional.
+                    # This prevents the "iteration over a 0-d array" error for single-item batches.
+                    if preds_np.ndim == 0:
+                        predictions.append(preds_np.item())
+                        actuals.append(actuals_np.item())
+                    else:
+                        predictions.extend(preds_np)
+                        actuals.extend(actuals_np)
+            
+            return np.array(predictions), np.array(actuals)
 
 
 def create_pattern_features(features, targets, pattern_extractor):
@@ -488,16 +499,11 @@ def create_pattern_features(features, targets, pattern_extractor):
     
     return np.array(pattern_features)
 
-
-def xgb_model_with_patterns(X_train, y_train, X_val, y_val, pattern_features_train, 
-                            pattern_features_val, plotting=False):
+### <<< ADDED/MODIFIED SECTION START >>>
+def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=False):
     """
-    패턴 정보를 활용한 XGBoost 모델
+    CNN+LSTM 예측을 포함한 스태킹 XGBoost 모델
     """
-    # 패턴 특징과 원본 특징 결합
-    X_train_combined = np.column_stack([X_train, pattern_features_train])
-    X_val_combined = np.column_stack([X_val, pattern_features_val])
-    
     # XGBoost 모델 정의 (하이퍼파라미터 튜닝)
     xgb_regressor = xgb.XGBRegressor(
         gamma=0.5, 
@@ -513,29 +519,29 @@ def xgb_model_with_patterns(X_train, y_train, X_val, y_val, pattern_features_tra
         reg_lambda=0.1
     )
     
+    print("XGBoost 스태킹 모델 학습 중...")
     # 모델 학습
     xgb_regressor.fit(
-        X_train_combined, 
+        X_train, 
         y_train, 
-        eval_set=[(X_val_combined, y_val)], 
+        eval_set=[(X_val, y_val)], 
         verbose=False
     )
     
-    # 검증 데이터에 대한 예측
-    pred_val = xgb_regressor.predict(X_val_combined)
-    mae = mean_absolute_error(y_val, pred_val)
-    rmse = calculate_rmse(y_val, pred_val)
-    # <<< 수정된 부분 시작 >>>
-    mape = calculate_mape(y_val, pred_val)
-    # <<< 수정된 부분 끝 >>>
+    # 테스트 데이터에 대한 예측
+    pred_test = xgb_regressor.predict(X_test)
+    mae = mean_absolute_error(y_test, pred_test)
+    rmse = calculate_rmse(y_test, pred_test)
+    mape = calculate_mape(y_test, pred_test)
     
     # 특성 중요도 출력
     feature_names = ['기온', '강수량', '일조', '일사량'] + \
-                    ['패턴', '연간_sin', '연간_cos', '일간_sin', '일간_cos', 
-                     '기온×일사량', '일조×일사량', '무강수여부']
+                      ['패턴', '연간_sin', '연간_cos', '일간_sin', '일간_cos', 
+                       '기온×일사량', '일조×일사량', '무강수여부'] + \
+                      ['CNN_LSTM_예측값'] # 스태킹 특성 이름 추가
     
     importance_dict = dict(zip(feature_names, xgb_regressor.feature_importances_))
-    print("\n=== XGBoost 특성 중요도 ===")
+    print("\n=== XGBoost 스태킹 모델 특성 중요도 ===")
     for feature, importance in sorted(importance_dict.items(), key=lambda x: x[1], reverse=True):
         print(f"{feature}: {importance:.4f}")
     
@@ -545,17 +551,17 @@ def xgb_model_with_patterns(X_train, y_train, X_val, y_val, pattern_features_tra
         
         # 예측 결과 플롯
         plt.subplot(2, 2, 1)
-        plt.plot(y_val[:200], label='Actual', alpha=0.7)
-        plt.plot(pred_val[:200], label='Predicted', alpha=0.7)
+        plt.plot(y_test[:200], label='Actual', alpha=0.7)
+        plt.plot(pred_test[:200], label='Predicted', alpha=0.7)
         plt.xlabel("Time")
         plt.ylabel("DC Power")
-        plt.title(f"XGBoost with Patterns - MAE: {mae:.3f}, RMSE: {rmse:.3f}, MAPE: {mape:.3f}%")
+        plt.title(f"XGBoost Stacked Model - MAE: {mae:.3f}, RMSE: {rmse:.3f}, MAPE: {mape:.3f}%")
         plt.legend()
         
         # 산점도
         plt.subplot(2, 2, 2)
-        plt.scatter(y_val, pred_val, alpha=0.5)
-        plt.plot([y_val.min(), y_val.max()], [y_val.min(), y_val.max()], 'r--', lw=2)
+        plt.scatter(y_test, pred_test, alpha=0.5)
+        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
         plt.xlabel('Actual')
         plt.ylabel('Predicted')
         plt.title('Actual vs Predicted')
@@ -573,8 +579,8 @@ def xgb_model_with_patterns(X_train, y_train, X_val, y_val, pattern_features_tra
         
         # 잔차 분석
         plt.subplot(2, 2, 4)
-        residuals = y_val - pred_val
-        plt.scatter(pred_val, residuals, alpha=0.5)
+        residuals = y_test - pred_test
+        plt.scatter(pred_test, residuals, alpha=0.5)
         plt.axhline(y=0, color='r', linestyle='--')
         plt.xlabel('Predicted')
         plt.ylabel('Residuals')
@@ -584,7 +590,10 @@ def xgb_model_with_patterns(X_train, y_train, X_val, y_val, pattern_features_tra
         plt.show()
         
     return mae, rmse, mape, xgb_regressor
+### <<< ADDED/MODIFIED SECTION END >>>
 
+# Deprecated original function to avoid confusion
+# def xgb_model_with_patterns(...)
 
 def create_sequences_and_split_with_patterns(features, targets, pattern_features, 
                                             seq_len=24, test_size=0.2, val_size=0.1):
@@ -623,70 +632,72 @@ if __name__ == "__main__":
         print("데이터 로딩 중...")
         data_df = pd.read_csv(data_path)
         
-        # 1. 정의된 전처리 함수를 호출하여 결측값을 먼저 처리합니다.
+        # 1. 데이터 전처리
         features, targets = preprocess_data(data_df)
-        
-        # 전처리가 실패했는지 확인 (예: 필요한 컬럼이 없는 경우)
         if features is None or targets is None:
             raise ValueError("데이터 전처리에 실패했습니다. 원본 데이터를 확인해주세요.")
 
-        print(f"데이터 크기: {len(features)} 행")
-        print("패턴 추출 중...")
-        
-        # 2. 깨끗해진 데이터를 기반으로 K-means를 활용하여 패턴을 추출합니다.
+        # 2. 패턴 추출 및 패턴 기반 특성 생성
+        print("\n패턴 추출 중...")
         pattern_extractor = PatternExtractor(n_patterns=5)
         pattern_features = create_pattern_features(features, targets, pattern_extractor)
         
-        print("데이터 전처리 중...")
         seq_len = 24
         
-        # 패턴 정보를 포함한 시퀀스 데이터 생성
-        (train_dataset, val_dataset, test_dataset, 
-        feature_scaler, target_scaler) = create_sequences_and_split_with_patterns(
-            features, targets, pattern_features, seq_len=seq_len
-        )
+        # 3. 데이터셋 시간순 분할 (70% train, 15% validation, 15% test)
+        print("\n시간순으로 데이터 분할...")
+        total_size = len(features)
+        train_end = int(total_size * 0.7)
+        val_end = int(total_size * 0.85)
+
+        features_train, targets_train, pattern_train = features[:train_end], targets[:train_end], pattern_features[:train_end]
+        features_val, targets_val, pattern_val = features[train_end:val_end], targets[train_end:val_end], pattern_features[train_end:val_end]
+        features_test, targets_test, pattern_test = features[val_end:], targets[val_end:], pattern_features[val_end:]
         
-        # DataLoader 생성
+        print(f"Train set size: {len(features_train)}")
+        print(f"Validation set size: {len(features_val)}")
+        print(f"Test set size: {len(features_test)}")
+
+        # 4. 데이터 스케일링 및 PyTorch Dataset/DataLoader 생성
+        feature_scaler = MinMaxScaler()
+        target_scaler = MinMaxScaler()
+
+        features_train_scaled = feature_scaler.fit_transform(features_train)
+        features_val_scaled = feature_scaler.transform(features_val)
+        features_test_scaled = feature_scaler.transform(features_test)
+
+        targets_train_scaled = target_scaler.fit_transform(targets_train.reshape(-1, 1)).flatten()
+        targets_val_scaled = target_scaler.transform(targets_val.reshape(-1, 1)).flatten()
+        targets_test_scaled = target_scaler.transform(targets_test.reshape(-1, 1)).flatten()
+        
+        train_dataset = SolarPatternDataset(features_train_scaled, targets_train_scaled, pattern_train[:, 0], seq_len)
+        val_dataset = SolarPatternDataset(features_val_scaled, targets_val_scaled, pattern_val[:, 0], seq_len)
+        test_dataset = SolarPatternDataset(features_test_scaled, targets_test_scaled, pattern_test[:, 0], seq_len)
+        
         batch_size = 32
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
         
-        print(f"Train batches: {len(train_loader)}")
-        print(f"Validation batches: {len(val_loader)}")
-        print(f"Test batches: {len(test_loader)}")
-        
-        # CNN + LSTM 모델 생성 및 학습
+        # 5. CNN + LSTM 모델 생성 및 학습
         model = CNN_LSTM_Pattern(input_dim=5, seq_len=seq_len, 
                                  hidden_dim=128, num_layers=2, n_patterns=5)
-        print("CNN+LSTM 모델 생성 완료")
-        
         print("\n" + "="*60)
         print("CNN+LSTM 모델 학습 시작...")
         print("="*60)
         train_losses, val_losses = model.train_model(
             train_loader=train_loader,
             val_loader=val_loader,
-            epochs=10,  # 에포크를 10으로 수정
+            epochs=10,
             lr=0.001
         )
         
-        # CNN+LSTM 테스트 예측
-        print("\nCNN+LSTM 테스트 예측 중...")
-        predictions, actuals = model.predict(test_loader)
-
-        # 예측값과 실제값에 NaN이 있는지 확인 (디버깅용)
-        if np.isnan(predictions).any() or np.isnan(actuals).any():
-            print("Warning: 예측 또는 실제값에 여전히 NaN이 포함되어 있습니다.")
-            # NaN을 0이나 평균값으로 대체하여 임시로 오류를 피할 수 있습니다.
-            predictions = np.nan_to_num(predictions)
-            actuals = np.nan_to_num(actuals)
+        # 6. CNN+LSTM 모델 성능 평가
+        print("\nCNN+LSTM 테스트 예측 및 평가 중...")
+        predictions_scaled, actuals_scaled = model.predict(test_loader)
+        predictions_original = target_scaler.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+        actuals_original = target_scaler.inverse_transform(actuals_scaled.reshape(-1, 1)).flatten()
         
-        # 원본 스케일로 변환
-        predictions_original = target_scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
-        actuals_original = target_scaler.inverse_transform(actuals.reshape(-1, 1)).flatten()
-        
-        # 성능 평가
         mae_cnn_lstm = mean_absolute_error(actuals_original, predictions_original)
         rmse_cnn_lstm = calculate_rmse(actuals_original, predictions_original)
         mape_cnn_lstm = calculate_mape(actuals_original, predictions_original)
@@ -696,34 +707,43 @@ if __name__ == "__main__":
         print(f"RMSE: {rmse_cnn_lstm:.4f}")
         print(f"MAPE: {mape_cnn_lstm:.4f}%")
         
-        # XGBoost 모델 학습 (비교용)
+        # 7. 스태킹을 위한 예측값 생성 (XGBoost의 새로운 특성)
         print("\n" + "="*60)
-        print("XGBoost 모델 학습 시작...")
+        print("스태킹을 위한 CNN+LSTM 예측값 생성 중...")
         print("="*60)
+        # 순서 유지를 위해 shuffle=False 로 DataLoader 재생성
+        train_loader_stack = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+        val_loader_stack = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
         
-        # 데이터 분할 (XGBoost용)
-        split_idx = int(len(features) * 0.8)
-        X_train_xgb, X_test_xgb = features[:split_idx], features[split_idx:]
-        y_train_xgb, y_test_xgb = targets[:split_idx], targets[split_idx:]
-        pattern_train_xgb = pattern_features[:split_idx]
-        pattern_test_xgb = pattern_features[split_idx:]
+        cnn_preds_train_scaled, _ = model.predict(train_loader_stack)
+        cnn_preds_val_scaled, _ = model.predict(val_loader_stack)
+        # 테스트 예측값은 이미 계산됨 (predictions_scaled)
         
-        # 검증 데이터 분할
-        val_split_idx = int(len(X_train_xgb) * 0.8)
-        X_train_final = X_train_xgb[:val_split_idx]
-        X_val_final = X_train_xgb[val_split_idx:]
-        y_train_final = y_train_xgb[:val_split_idx]
-        y_val_final = y_train_xgb[val_split_idx:]
-        pattern_train_final = pattern_train_xgb[:val_split_idx]
-        pattern_val_final = pattern_train_xgb[val_split_idx:]
+        cnn_preds_train = target_scaler.inverse_transform(cnn_preds_train_scaled.reshape(-1, 1))
+        cnn_preds_val = target_scaler.inverse_transform(cnn_preds_val_scaled.reshape(-1, 1))
+        cnn_preds_test = predictions_original.reshape(-1, 1) # 이미 원본 스케일
+
+        # 8. XGBoost 학습을 위한 데이터 준비
+        # CNN+LSTM 예측값과 원래 특성들을 결합
+        # 시퀀스 생성으로 인해 데이터 길이가 줄어든 것을 반영 (앞부분 seq_len 만큼 제거)
+        X_train_xgb = np.hstack([features_train[seq_len:], pattern_train[seq_len:], cnn_preds_train])
+        y_train_xgb = targets_train[seq_len:]
         
-        # XGBoost 학습
-        mae_xgb, rmse_xgb, mape_xgb, xgb_model = xgb_model_with_patterns(
-            X_train_final, y_train_final, X_val_final, y_val_final,
-            pattern_train_final, pattern_val_final, plotting=True
+        X_val_xgb = np.hstack([features_val[seq_len:], pattern_val[seq_len:], cnn_preds_val])
+        y_val_xgb = targets_val[seq_len:]
+        
+        X_test_xgb = np.hstack([features_test[seq_len:], pattern_test[seq_len:], cnn_preds_test])
+        y_test_xgb = targets_test[seq_len:]
+
+        # 9. XGBoost 스태킹 모델 학습 및 평가
+        print("\n" + "="*60)
+        print("XGBoost 스태킹 앙상블 모델 학습 시작...")
+        print("="*60)
+        mae_xgb, rmse_xgb, mape_xgb, xgb_model = xgb_stacking_model(
+            X_train_xgb, y_train_xgb, X_val_xgb, y_val_xgb, X_test_xgb, y_test_xgb, plotting=True
         )
         
-        print(f"\n=== XGBoost 모델 성능 평가 ===")
+        print(f"\n=== XGBoost 스태킹 모델 성능 평가 ===")
         print(f"MAE: {mae_xgb:.4f}")
         print(f"RMSE: {rmse_xgb:.4f}")
         print(f"MAPE: {mape_xgb:.4f}%")
@@ -732,8 +752,8 @@ if __name__ == "__main__":
         print(f"\n{'='*60}")
         print("최종 모델 성능 비교")
         print(f"{'='*60}")
-        print(f"CNN+LSTM: MAE={mae_cnn_lstm:.4f}, RMSE={rmse_cnn_lstm:.4f}, MAPE={mape_cnn_lstm:.2f}%")
-        print(f"XGBoost:  MAE={mae_xgb:.4f}, RMSE={rmse_xgb:.4f}, MAPE={mape_xgb:.2f}%")
+        print(f"CNN+LSTM         : MAE={mae_cnn_lstm:.4f}, RMSE={rmse_cnn_lstm:.4f}, MAPE={mape_cnn_lstm:.2f}%")
+        print(f"XGBoost (Stacked): MAE={mae_xgb:.4f}, RMSE={rmse_xgb:.4f}, MAPE={mape_xgb:.2f}%")
         
         # 학습 곡선 시각화
         if train_losses and val_losses:
