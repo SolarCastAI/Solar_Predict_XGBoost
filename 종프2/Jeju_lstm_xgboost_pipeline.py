@@ -335,7 +335,6 @@ class LSTM_Pattern(nn.Module):
         # FC layers with batch normalization
         out = self.fc1(out)
         out = self.batch_norm1(out)
-        # --- FIX START ---
         # Changed self.relu(out) to F.relu(out)
         out = F.relu(out)
         # --- FIX END ---
