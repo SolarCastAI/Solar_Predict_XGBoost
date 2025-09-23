@@ -538,6 +538,9 @@ class GRU_Pattern(nn.Module):
             self.train()
             train_loss = 0
             for batch_X, batch_y in train_loader:
+                # CUDA로 이동
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
                 optimizer.zero_grad()
                 preds = self(batch_X)
                 loss = criterion(preds, batch_y)
@@ -558,6 +561,9 @@ class GRU_Pattern(nn.Module):
                 val_loss = 0
                 with torch.no_grad():
                     for batch_X, batch_y in val_loader:
+                        # CUDA로 이동
+                        batch_X = batch_X.to(device)
+                        batch_y = batch_y.to(device)
                         preds = self(batch_X)
                         loss = criterion(preds, batch_y)
                         val_loss += loss.item()
@@ -606,6 +612,9 @@ class GRU_Pattern(nn.Module):
         
         with torch.no_grad():
             for batch_X, batch_y in test_loader:
+                # CUDA로 이동
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
                 preds = self(batch_X)
                 
                 # Convert tensors to numpy arrays

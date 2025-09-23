@@ -18,6 +18,19 @@ from sklearn.impute import SimpleImputer
 import xgboost as xgb
 from xgboost import plot_importance
 
+# GPU/CUDA 설정
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"🚀 사용 중인 디바이스: {device}")
+if torch.cuda.is_available():
+    print(f"   GPU: {torch.cuda.get_device_name(0)}")
+    print(f"   CUDA 버전: {torch.version.cuda}")
+    print(f"   GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    # GPU 메모리 최적화 설정
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = True  # 성능 향상
+else:
+    print("   ⚠️  CUDA를 사용할 수 없습니다. CPU를 사용합니다.")
+
 # 데이터 경로
 data_path = "C:/Users/rlask/종프2/dataset/jeju_solar_utf8.csv"
 warnings.filterwarnings("ignore")
@@ -376,6 +389,9 @@ class LSTM_Pattern(nn.Module):
             self.train()
             train_loss = 0
             for batch_X, batch_y in train_loader:
+                # CUDA로 이동
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
                 optimizer.zero_grad()
                 preds = self(batch_X)
                 loss = criterion(preds, batch_y)
@@ -396,6 +412,9 @@ class LSTM_Pattern(nn.Module):
                 val_loss = 0
                 with torch.no_grad():
                     for batch_X, batch_y in val_loader:
+                        # CUDA로 이동
+                        batch_X = batch_X.to(device)
+                        batch_y = batch_y.to(device)
                         preds = self(batch_X)
                         loss = criterion(preds, batch_y)
                         val_loss += loss.item()
@@ -444,6 +463,9 @@ class LSTM_Pattern(nn.Module):
             
             with torch.no_grad():
                 for batch_X, batch_y in test_loader:
+                    # CUDA로 이동
+                    batch_X = batch_X.to(device)
+                    batch_y = batch_y.to(device)
                     preds = self(batch_X)
                     
                     # Convert tensors to numpy arrays
@@ -670,6 +692,8 @@ if __name__ == "__main__":
         # 5. LSTM 모델 생성 및 학습
         model = LSTM_Pattern(weather_feature_dim=4, pattern_embedding_dim=8, 
                                hidden_dim=128, num_layers=2, n_patterns=5)
+        # CUDA로 이동
+        model.to(device)
         print("\n" + "="*60)
         print("LSTM 모델 학습 시작...")
         print("="*60)
