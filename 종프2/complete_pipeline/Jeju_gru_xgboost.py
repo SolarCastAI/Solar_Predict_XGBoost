@@ -885,11 +885,13 @@ if __name__ == "__main__":
         plt.ylabel('예측값')
         plt.title('Stacked: 실제값 vs 예측값')
         plt.grid(True, alpha=0.3)
-        
+        # for debug
+        print("feature_names 길이:", len(feature_names))
+        print("feature_importances_ 길이:", len(xgb_stacking_regressor.feature_importances_))
         # 4. 특성 중요도
         plt.subplot(3, 4, 9)
         importance_df = pd.DataFrame({
-            'feature': feature_names,
+            'feature': importance_dict.keys(),
             'importance': xgb_stacking_regressor.feature_importances_
         }).sort_values('importance', ascending=True)
         
