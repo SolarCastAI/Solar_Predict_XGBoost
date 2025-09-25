@@ -12,7 +12,7 @@ import os
 import time
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 import xgboost as xgb
@@ -21,18 +21,10 @@ from xgboost import plot_importance
 # GPU/CUDA 설정
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"🚀 사용 중인 디바이스: {device}")
-if torch.cuda.is_available():
-    print(f"   GPU: {torch.cuda.get_device_name(0)}")
-    print(f"   CUDA 버전: {torch.version.cuda}")
-    print(f"   GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    # GPU 메모리 최적화 설정
-    torch.cuda.empty_cache()
-    torch.backends.cudnn.benchmark = True  # 성능 향상
-else:
-    print("   ⚠️  CUDA를 사용할 수 없습니다. CPU를 사용합니다.")
+
 
 # 데이터 경로
-data_path = "C:/Users/rlask/종프2/dataset/jeju_solar_utf8.csv"
+data_path = "./dataset/jeju_solar_utf8.csv"
 warnings.filterwarnings("ignore")
 
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -42,15 +34,215 @@ plt.rcParams['axes.unicode_minus'] = False # 마이너스 기호 깨짐 방지
 
 
 def calculate_rmse(y_true, y_pred):
+    """RMSE 계산"""
     return np.sqrt(mean_squared_error(y_true, y_pred))
 
-def calculate_mape(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    non_zero_mask = y_true != 0
-    # Handle cases where all true values are zero
-    if not np.any(non_zero_mask):
+
+def calculate_r2(y_true, y_pred):
+    """R² 결정계수 계산"""
+    return r2_score(y_true, y_pred)
+
+
+def calculate_mape(y_true, y_pred, method='improved'):
+    """
+    개선된 MAPE 계산 - 태양광 발전량 특성을 고려한 여러 방법 제공
+    
+    Args:
+        y_true: 실제값
+        y_pred: 예측값
+        method: 계산 방법
+            - 'improved': 개선된 MAPE (기본값)
+            - 'threshold': 임계값 기반 MAPE
+            - 'weighted': 가중 MAPE
+            - 'symmetric': 대칭 MAPE
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    
+    # NaN 및 무한값 확인 및 제거
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true_clean = y_true[valid_mask]
+    y_pred_clean = y_pred[valid_mask]
+    
+    if len(y_true_clean) == 0:
+        print("Warning: 유효한 데이터가 없어 MAPE를 계산할 수 없습니다.")
+        return np.nan
+    
+    if method == 'improved':
+        """
+        개선된 MAPE: 작은 값들에 대한 가중치를 조정하여 
+        전체적인 예측 성능을 더 잘 반영
+        """
+        # 전체 데이터의 분포를 고려한 임계값 설정
+        threshold = np.percentile(y_true_clean, 10)  # 하위 10% 값을 임계값으로 사용
+        
+        # 임계값 이상인 데이터에 대해서만 MAPE 계산
+        significant_mask = y_true_clean >= threshold
+        
+        if not np.any(significant_mask):
+            # 모든 값이 임계값 미만인 경우, 절대 오차 기반 계산
+            abs_errors = np.abs(y_true_clean - y_pred_clean)
+            mean_actual = np.mean(y_true_clean)
+            if mean_actual > 0:
+                return (np.mean(abs_errors) / mean_actual) * 100
+            else:
+                return 0.0
+        
+        y_true_sig = y_true_clean[significant_mask]
+        y_pred_sig = y_pred_clean[significant_mask]
+        
+        # 가중 평균 MAPE 계산
+        weights = y_true_sig / np.sum(y_true_sig)  # 실제값에 비례한 가중치
+        percentage_errors = np.abs((y_true_sig - y_pred_sig) / y_true_sig)
+        
+        # 극단적인 오차 제한
+        percentage_errors = np.clip(percentage_errors, 0, 2)  # 최대 200% 오차로 제한
+        
+        mape_value = np.sum(weights * percentage_errors) * 100
+        
+        # 제거된 데이터 비율 출력
+        removed_count = len(y_true_clean) - len(y_true_sig)
+        if removed_count > 0:
+            removal_rate = (removed_count / len(y_true_clean)) * 100
+            print(f"MAPE 계산 시 작은 값 제외: {removed_count}개 ({removal_rate:.1f}%)")
+    
+    elif method == 'threshold':
+        """
+        임계값 기반 MAPE: 일정 값 이상의 데이터만 사용
+        """
+        # 동적 임계값 계산 (평균의 10%)
+        threshold = np.mean(y_true_clean) * 0.1
+        
+        above_threshold = y_true_clean > threshold
+        
+        if not np.any(above_threshold):
+            return 0.0
+            
+        y_true_filtered = y_true_clean[above_threshold]
+        y_pred_filtered = y_pred_clean[above_threshold]
+        
+        percentage_errors = np.abs((y_true_filtered - y_pred_filtered) / y_true_filtered)
+        percentage_errors = np.clip(percentage_errors, 0, 1.5)  # 150% 제한
+        
+        mape_value = np.mean(percentage_errors) * 100
+        
+        removed_count = len(y_true_clean) - len(y_true_filtered)
+        print(f"임계값({threshold:.3f}) 미만 제외: {removed_count}개")
+    
+    elif method == 'weighted':
+        """
+        가중 MAPE: 값의 크기에 따라 가중치 부여
+        """
+        # 0에 가까운 값 제외
+        non_zero_mask = y_true_clean > np.percentile(y_true_clean, 5)
+        
+        if not np.any(non_zero_mask):
+            return 0.0
+            
+        y_true_nz = y_true_clean[non_zero_mask]
+        y_pred_nz = y_pred_clean[non_zero_mask]
+        
+        # 실제값의 크기에 비례한 가중치
+        weights = y_true_nz / np.sum(y_true_nz)
+        
+        percentage_errors = np.abs((y_true_nz - y_pred_nz) / y_true_nz)
+        percentage_errors = np.clip(percentage_errors, 0, 1.0)  # 100% 제한
+        
+        mape_value = np.sum(weights * percentage_errors) * 100
+    
+    elif method == 'symmetric':
+        """
+        대칭 MAPE (SMAPE): 분모에 실제값과 예측값의 평균 사용
+        """
+        # 매우 작은 값들 제외
+        min_threshold = np.percentile(np.abs(y_true_clean), 5)
+        valid_mask = np.abs(y_true_clean) > min_threshold
+        
+        if not np.any(valid_mask):
+            return 0.0
+            
+        y_true_filtered = y_true_clean[valid_mask]
+        y_pred_filtered = y_pred_clean[valid_mask]
+        
+        denominator = (np.abs(y_true_filtered) + np.abs(y_pred_filtered)) / 2
+        percentage_errors = np.abs(y_true_filtered - y_pred_filtered) / denominator
+        percentage_errors = np.clip(percentage_errors, 0, 1.0)  # 100% 제한
+        
+        mape_value = np.mean(percentage_errors) * 100
+    
+    else:
+        raise ValueError("지원하지 않는 MAPE 계산 방법입니다.")
+    
+    return mape_value
+
+
+def calculate_normalized_mape(y_true, y_pred):
+    """
+    정규화된 MAPE: 데이터 범위에 따라 정규화
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    
+    # 유효한 데이터만 선택
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true > 0)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    
+    if len(y_true_valid) == 0:
         return 0.0
-    return np.mean(np.abs((y_true[non_zero_mask] - y_pred[non_zero_mask]) / y_true[non_zero_mask])) * 100
+    
+    # 데이터 범위 계산
+    data_range = np.max(y_true_valid) - np.min(y_true_valid)
+    
+    if data_range == 0:
+        return 0.0
+    
+    # 절대 오차를 데이터 범위로 정규화
+    absolute_errors = np.abs(y_true_valid - y_pred_valid)
+    normalized_errors = absolute_errors / data_range
+    
+    # 백분율로 변환
+    return np.mean(normalized_errors) * 100
+
+
+def calculate_all_metrics(y_true, y_pred, print_details=False):
+    """
+    모든 성능 지표를 일괄 계산
+    """
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = calculate_rmse(y_true, y_pred)
+    r2 = calculate_r2(y_true, y_pred)
+    
+    # 다양한 MAPE 계산
+    mape_improved = calculate_mape(y_true, y_pred, method='improved')
+    mape_threshold = calculate_mape(y_true, y_pred, method='threshold')
+    mape_weighted = calculate_mape(y_true, y_pred, method='weighted')
+    mape_symmetric = calculate_mape(y_true, y_pred, method='symmetric')
+    mape_normalized = calculate_normalized_mape(y_true, y_pred)
+    
+    if print_details:
+        print(f"MAE: {mae:.4f}")
+        print(f"RMSE: {rmse:.4f}")
+        print(f"R²: {r2:.4f}")
+        print(f"MAPE (개선됨): {mape_improved:.2f}%")
+        print(f"MAPE (임계값): {mape_threshold:.2f}%")
+        print(f"MAPE (가중): {mape_weighted:.2f}%")
+        print(f"MAPE (대칭): {mape_symmetric:.2f}%")
+        print(f"MAPE (정규화): {mape_normalized:.2f}%")
+        
+        # 추천 MAPE 선택
+        print(f"\n추천 MAPE (개선됨): {mape_improved:.2f}%")
+    
+    return {
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'mape_improved': mape_improved,
+        'mape_threshold': mape_threshold,
+        'mape_weighted': mape_weighted,
+        'mape_symmetric': mape_symmetric,
+        'mape_normalized': mape_normalized
+    }
 
 
 def preprocess_data(data_df):
@@ -357,13 +549,14 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
     pred_test = xgb_regressor.predict(X_test)
     mae = mean_absolute_error(y_test, pred_test)
     rmse = calculate_rmse(y_test, pred_test)
+    r2 = calculate_r2(y_test, pred_test)
     mape = calculate_mape(y_test, pred_test)
     
     # 특성 중요도 출력
     feature_names = ['기온', '강수량', '일조', '일사량'] + \
                       ['패턴', '연간_sin', '연간_cos', '일간_sin', '일간_cos', 
                        '기온×일사량', '일조×일사량', '무강수여부'] + \
-                      ['LSTM_예측값'] # 스태킹 특성 이름 변경
+                      ['GRU_예측값'] # 스태킹 특성 이름 변경
     
     importance_dict = dict(zip(feature_names, xgb_regressor.feature_importances_))
     print("\n=== XGBoost 스태킹 모델 특성 중요도 ===")
@@ -380,7 +573,7 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         plt.plot(pred_test[:200], label='Predicted', alpha=0.7)
         plt.xlabel("Time")
         plt.ylabel("발전량 (MWh)")
-        plt.title(f"XGBoost 스태킹 모델 - MAE: {mae:.3f}, RMSE: {rmse:.3f}, MAPE: {mape:.3f}%")
+        plt.title(f"XGBoost 스태킹 모델\nMAE: {mae:.3f}, RMSE: {rmse:.3f}, R²: {r2:.3f}")
         plt.legend()
         
         # 산점도
@@ -414,7 +607,7 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         plt.tight_layout()
         plt.show()
         
-    return mae, rmse, mape, xgb_regressor
+    return mae, rmse, r2, mape, xgb_regressor
 
 def create_sequences_and_split_with_patterns(features, targets, pattern_features, 
                                             seq_len=24, test_size=0.2, val_size=0.1):
@@ -538,6 +731,9 @@ class GRU_Pattern(nn.Module):
             self.train()
             train_loss = 0
             for batch_X, batch_y in train_loader:
+                # CUDA로 이동
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
                 optimizer.zero_grad()
                 preds = self(batch_X)
                 loss = criterion(preds, batch_y)
@@ -558,6 +754,9 @@ class GRU_Pattern(nn.Module):
                 val_loss = 0
                 with torch.no_grad():
                     for batch_X, batch_y in val_loader:
+                        # CUDA로 이동
+                        batch_X = batch_X.to(device)
+                        batch_y = batch_y.to(device)
                         preds = self(batch_X)
                         loss = criterion(preds, batch_y)
                         val_loss += loss.item()
@@ -606,6 +805,9 @@ class GRU_Pattern(nn.Module):
         
         with torch.no_grad():
             for batch_X, batch_y in test_loader:
+                # CUDA로 이동
+                batch_X = batch_X.to(device)
+                batch_y = batch_y.to(device)
                 preds = self(batch_X)
                 
                 # Convert tensors to numpy arrays
@@ -693,7 +895,7 @@ if __name__ == "__main__":
         gru_train_losses, gru_val_losses = gru_model.train_model(
             train_loader=train_loader,
             val_loader=val_loader,
-            epochs=10,
+            epochs=100,
             lr=0.001
         )
         
@@ -705,16 +907,18 @@ if __name__ == "__main__":
         
         mae_gru = mean_absolute_error(gru_actuals_original, gru_predictions_original)
         rmse_gru = calculate_rmse(gru_actuals_original, gru_predictions_original)
+        r2_gru = calculate_r2(gru_actuals_original, gru_predictions_original)
         mape_gru = calculate_mape(gru_actuals_original, gru_predictions_original)
         
         print(f"\n=== GRU 모델 성능 평가 ===")
         print(f"MAE: {mae_gru:.4f}")
         print(f"RMSE: {rmse_gru:.4f}")
+        print(f"R²: {r2_gru:.4f}")
         print(f"MAPE: {mape_gru:.4f}%")
         
         # 8. 스태킹을 위한 예측값 생성
         print("\n" + "="*60)
-        print("스태킹을 위한 LSTM & GRU 예측값 생성 중...")
+        print("스태킹을 위한 GRU 예측값 생성 중...")
         print("="*60)
         
         # Train set 예측값 생성
@@ -755,7 +959,7 @@ if __name__ == "__main__":
         ])
         y_test_stack = targets_test[seq_len:]
         
-        print(f"스태킹 특성 차원: {X_train_stack.shape[1]} (기상 4 + 패턴 8 + LSTM 1 + GRU 1)")
+        print(f"스태킹 특성 차원: {X_train_stack.shape[1]} (기상 4 + 패턴 8 + GRU 1)")
         
         # 10. XGBoost 스태킹 모델 학습 및 평가
         print("\n" + "="*60)
@@ -766,7 +970,7 @@ if __name__ == "__main__":
         feature_names = ['기온', '강수량', '일조', '일사량'] + \
                        ['패턴', '연간_sin', '연간_cos', '일간_sin', '일간_cos', 
                         '기온×일사량', '일조×일사량', '무강수여부'] + \
-                       ['LSTM_예측값', 'GRU_예측값']
+                       ['GRU_예측값']
         
         # XGBoost 모델 정의 및 학습
         xgb_stacking_regressor = xgb.XGBRegressor(
@@ -797,11 +1001,13 @@ if __name__ == "__main__":
         
         mae_stacked = mean_absolute_error(y_test_stack, stacked_pred_test)
         rmse_stacked = calculate_rmse(y_test_stack, stacked_pred_test)
+        r2_stacked = calculate_r2(y_test_stack, stacked_pred_test)
         mape_stacked = calculate_mape(y_test_stack, stacked_pred_test)
         
         print(f"\n=== XGBoost 스태킹 모델 성능 평가 ===")
         print(f"MAE: {mae_stacked:.4f}")
         print(f"RMSE: {rmse_stacked:.4f}")
+        print(f"R²: {r2_stacked:.4f}")
         print(f"MAPE: {mape_stacked:.4f}%")
         
         # 11. 특성 중요도 분석
@@ -814,10 +1020,10 @@ if __name__ == "__main__":
         print(f"\n{'='*80}")
         print("최종 모델 성능 비교")
         print(f"{'='*80}")
-        print(f"{'모델':<20} {'MAE':<10} {'RMSE':<10} {'MAPE (%)':<10}")
-        print("-" * 50)
-        print(f"{'GRU':<20} {mae_gru:<10.4f} {rmse_gru:<10.4f} {mape_gru:<10.2f}")
-        print(f"{'XGBoost Stacking':<20} {mae_stacked:<10.4f} {rmse_stacked:<10.4f} {mape_stacked:<10.2f}")
+        print(f"{'모델':<20} {'MAE':<10} {'RMSE':<10} {'R²':<10} {'MAPE (%)':<10}")
+        print("-" * 60)
+        print(f"{'GRU':<20} {mae_gru:<10.4f} {rmse_gru:<10.4f} {r2_gru:<10.4f} {mape_gru:<10.2f}")
+        print(f"{'XGBoost Stacking':<20} {mae_stacked:<10.4f} {rmse_stacked:<10.4f} {r2_stacked:<10.4f} {mape_stacked:<10.2f}")
         
         
         # 13. 결과 시각화
@@ -844,7 +1050,7 @@ if __name__ == "__main__":
         plt.plot(gru_predictions_original[:test_range], label='GRU', alpha=0.7)
         plt.xlabel('Time')
         plt.ylabel('발전량 (MWh)')
-        plt.title(f'GRU 예측 결과\nMAE: {mae_gru:.3f}')
+        plt.title(f'GRU 예측 결과\nMAE: {mae_gru:.3f}, R²: {r2_gru:.3f}')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -853,7 +1059,7 @@ if __name__ == "__main__":
         plt.plot(stacked_pred_test[:test_range], label='Stacked', alpha=0.7)
         plt.xlabel('Time')
         plt.ylabel('발전량 (MWh)')
-        plt.title(f'XGBoost 스태킹 결과\nMAE: {mae_stacked:.3f}')
+        plt.title(f'XGBoost 스태킹 결과\nMAE: {mae_stacked:.3f}, R²: {r2_stacked:.3f}')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -880,7 +1086,7 @@ if __name__ == "__main__":
         # 4. 특성 중요도
         plt.subplot(3, 4, 9)
         importance_df = pd.DataFrame({
-            'feature': feature_names,
+            'feature': list(importance_dict.keys()),
             'importance': xgb_stacking_regressor.feature_importances_
         }).sort_values('importance', ascending=True)
         
@@ -914,17 +1120,18 @@ if __name__ == "__main__":
         plt.show()
         
         # 14. 성능 메트릭 비교 막대 그래프
-        plt.figure(figsize=(15, 5))
+        plt.figure(figsize=(20, 5))
         
-        models = [ 'GRU', 'XGBoost\nStacking']
-        mae_scores = [ mae_gru, mae_stacked]
-        rmse_scores = [ rmse_gru, rmse_stacked]
-        mape_scores = [ mape_gru, mape_stacked]
+        models = ['GRU', 'XGBoost\nStacking']
+        mae_scores = [mae_gru, mae_stacked]
+        rmse_scores = [rmse_gru, rmse_stacked]
+        r2_scores = [r2_gru, r2_stacked]
+        mape_scores = [mape_gru, mape_stacked]
         
         x = np.arange(len(models))
         width = 0.25
         
-        plt.subplot(1, 3, 1)
+        plt.subplot(1, 4, 1)
         plt.bar(x, mae_scores, width, label='MAE', alpha=0.8)
         plt.xlabel('모델')
         plt.ylabel('MAE')
@@ -932,7 +1139,7 @@ if __name__ == "__main__":
         plt.xticks(x, models)
         plt.grid(True, alpha=0.3)
         
-        plt.subplot(1, 3, 2)
+        plt.subplot(1, 4, 2)
         plt.bar(x, rmse_scores, width, label='RMSE', alpha=0.8, color='orange')
         plt.xlabel('모델')
         plt.ylabel('RMSE')
@@ -940,20 +1147,25 @@ if __name__ == "__main__":
         plt.xticks(x, models)
         plt.grid(True, alpha=0.3)
         
-        plt.subplot(1, 3, 3)
-        plt.bar(x, mape_scores, width, label='MAPE (%)', alpha=0.8, color='green')
+        plt.subplot(1, 4, 3)
+        plt.bar(x, r2_scores, width, label='R²', alpha=0.8, color='green')
+        plt.xlabel('모델')
+        plt.ylabel('R²')
+        plt.title('R² 비교 (높을수록 좋음)')
+        plt.xticks(x, models)
+        plt.grid(True, alpha=0.3)
+        
+        plt.subplot(1, 4, 4)
+        plt.bar(x, mape_scores, width, label='MAPE (%)', alpha=0.8, color='red')
         plt.xlabel('모델')
         plt.ylabel('MAPE (%)')
-        plt.title('MAPE 비교')
+        plt.title('MAPE 비교 (낮을수록 좋음)')
         plt.xticks(x, models)
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.show()
         
-        print(f"\n{'='*80}")
-        print("모델 학습 및 평가 완료!")
-        print(f"{'='*80}")
         
     except FileNotFoundError:
         print(f"Error: 파일을 찾을 수 없습니다. 경로를 확인해주세요: {data_path}")
