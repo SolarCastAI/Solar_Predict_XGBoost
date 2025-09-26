@@ -905,10 +905,12 @@ if __name__ == "__main__":
         gru_predictions_original = target_scaler.inverse_transform(gru_predictions_scaled.reshape(-1, 1)).flatten()
         gru_actuals_original = target_scaler.inverse_transform(gru_actuals_scaled.reshape(-1, 1)).flatten()
         
-        mae_gru = mean_absolute_error(gru_actuals_original, gru_predictions_original)
-        rmse_gru = calculate_rmse(gru_actuals_original, gru_predictions_original)
-        r2_gru = calculate_r2(gru_actuals_original, gru_predictions_original)
-        mape_gru = calculate_mape(gru_actuals_original, gru_predictions_original)
+        # 기존 개별 메트릭 계산 → calculate_all_metrics로 변경
+        gru_metrics = calculate_all_metrics(gru_actuals_original, gru_predictions_original, print_details=True)
+        mae_gru = gru_metrics['mae']
+        rmse_gru = gru_metrics['rmse']
+        r2_gru = gru_metrics['r2']
+        mape_gru = gru_metrics['mape_improved']
         
         print(f"\n=== GRU 모델 성능 평가 ===")
         print(f"MAE: {mae_gru:.4f}")
@@ -999,10 +1001,12 @@ if __name__ == "__main__":
         # 스태킹 모델 예측 및 평가
         stacked_pred_test = xgb_stacking_regressor.predict(X_test_stack)
         
-        mae_stacked = mean_absolute_error(y_test_stack, stacked_pred_test)
-        rmse_stacked = calculate_rmse(y_test_stack, stacked_pred_test)
-        r2_stacked = calculate_r2(y_test_stack, stacked_pred_test)
-        mape_stacked = calculate_mape(y_test_stack, stacked_pred_test)
+        # 기존 개별 메트릭 계산 → calculate_all_metrics로 변경
+        stacked_metrics = calculate_all_metrics(y_test_stack, stacked_pred_test, print_details=True)
+        mae_stacked = stacked_metrics['mae']
+        rmse_stacked = stacked_metrics['rmse']
+        r2_stacked = stacked_metrics['r2']
+        mape_stacked = stacked_metrics['mape_improved']
         
         print(f"\n=== XGBoost 스태킹 모델 성능 평가 ===")
         print(f"MAE: {mae_stacked:.4f}")
