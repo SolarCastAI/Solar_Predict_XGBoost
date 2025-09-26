@@ -12,7 +12,7 @@ import os
 import time
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 import xgboost as xgb
@@ -46,13 +46,208 @@ plt.rcParams['axes.unicode_minus'] = False # 마이너스 기호 깨짐 방지
 def calculate_rmse(y_true, y_pred):
     return np.sqrt(mean_squared_error(y_true, y_pred))
 
-def calculate_mape(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    non_zero_mask = y_true != 0
-    # Handle cases where all true values are zero
-    if not np.any(non_zero_mask):
+def calculate_r2(y_true, y_pred):
+    return r2_score(y_true, y_pred)
+
+def calculate_mape(y_true, y_pred, method='improved'):
+    """
+    개선된 MAPE 계산 - 태양광 발전량 특성을 고려한 여러 방법 제공
+    
+    Args:
+        y_true: 실제값
+        y_pred: 예측값
+        method: 계산 방법
+            - 'improved': 개선된 MAPE (기본값)
+            - 'threshold': 임계값 기반 MAPE
+            - 'weighted': 가중 MAPE
+            - 'symmetric': 대칭 MAPE
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    
+    # NaN 및 무한값 확인 및 제거
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true_clean = y_true[valid_mask]
+    y_pred_clean = y_pred[valid_mask]
+    
+    if len(y_true_clean) == 0:
+        print("Warning: 유효한 데이터가 없어 MAPE를 계산할 수 없습니다.")
+        return np.nan
+    
+    if method == 'improved':
+        """
+        개선된 MAPE: 작은 값들에 대한 가중치를 조정하여 
+        전체적인 예측 성능을 더 잘 반영
+        """
+        # 전체 데이터의 분포를 고려한 임계값 설정
+        threshold = np.percentile(y_true_clean, 10)  # 하위 10% 값을 임계값으로 사용
+        
+        # 임계값 이상인 데이터에 대해서만 MAPE 계산
+        significant_mask = y_true_clean >= threshold
+        
+        if not np.any(significant_mask):
+            # 모든 값이 임계값 미만인 경우, 절대 오차 기반 계산
+            abs_errors = np.abs(y_true_clean - y_pred_clean)
+            mean_actual = np.mean(y_true_clean)
+            if mean_actual > 0:
+                return (np.mean(abs_errors) / mean_actual) * 100
+            else:
+                return 0.0
+        
+        y_true_sig = y_true_clean[significant_mask]
+        y_pred_sig = y_pred_clean[significant_mask]
+        
+        # 가중 평균 MAPE 계산
+        weights = y_true_sig / np.sum(y_true_sig)  # 실제값에 비례한 가중치
+        percentage_errors = np.abs((y_true_sig - y_pred_sig) / y_true_sig)
+        
+        # 극단적인 오차 제한
+        percentage_errors = np.clip(percentage_errors, 0, 2)  # 최대 200% 오차로 제한
+        
+        mape_value = np.sum(weights * percentage_errors) * 100
+        
+        # 제거된 데이터 비율 출력
+        removed_count = len(y_true_clean) - len(y_true_sig)
+        if removed_count > 0:
+            removal_rate = (removed_count / len(y_true_clean)) * 100
+            print(f"MAPE 계산 시 작은 값 제외: {removed_count}개 ({removal_rate:.1f}%)")
+    
+    elif method == 'threshold':
+        """
+        임계값 기반 MAPE: 일정 값 이상의 데이터만 사용
+        """
+        # 동적 임계값 계산 (평균의 10%)
+        threshold = np.mean(y_true_clean) * 0.1
+        
+        above_threshold = y_true_clean > threshold
+        
+        if not np.any(above_threshold):
+            return 0.0
+            
+        y_true_filtered = y_true_clean[above_threshold]
+        y_pred_filtered = y_pred_clean[above_threshold]
+        
+        percentage_errors = np.abs((y_true_filtered - y_pred_filtered) / y_true_filtered)
+        percentage_errors = np.clip(percentage_errors, 0, 1.5)  # 150% 제한
+        
+        mape_value = np.mean(percentage_errors) * 100
+        
+        removed_count = len(y_true_clean) - len(y_true_filtered)
+        print(f"임계값({threshold:.3f}) 미만 제외: {removed_count}개")
+    
+    elif method == 'weighted':
+        """
+        가중 MAPE: 값의 크기에 따라 가중치 부여
+        """
+        # 0에 가까운 값 제외
+        non_zero_mask = y_true_clean > np.percentile(y_true_clean, 5)
+        
+        if not np.any(non_zero_mask):
+            return 0.0
+            
+        y_true_nz = y_true_clean[non_zero_mask]
+        y_pred_nz = y_pred_clean[non_zero_mask]
+        
+        # 실제값의 크기에 비례한 가중치
+        weights = y_true_nz / np.sum(y_true_nz)
+        
+        percentage_errors = np.abs((y_true_nz - y_pred_nz) / y_true_nz)
+        percentage_errors = np.clip(percentage_errors, 0, 1.0)  # 100% 제한
+        
+        mape_value = np.sum(weights * percentage_errors) * 100
+    
+    elif method == 'symmetric':
+        """
+        대칭 MAPE (SMAPE): 분모에 실제값과 예측값의 평균 사용
+        """
+        # 매우 작은 값들 제외
+        min_threshold = np.percentile(np.abs(y_true_clean), 5)
+        valid_mask = np.abs(y_true_clean) > min_threshold
+        
+        if not np.any(valid_mask):
+            return 0.0
+            
+        y_true_filtered = y_true_clean[valid_mask]
+        y_pred_filtered = y_pred_clean[valid_mask]
+        
+        denominator = (np.abs(y_true_filtered) + np.abs(y_pred_filtered)) / 2
+        percentage_errors = np.abs(y_true_filtered - y_pred_filtered) / denominator
+        percentage_errors = np.clip(percentage_errors, 0, 1.0)  # 100% 제한
+        
+        mape_value = np.mean(percentage_errors) * 100
+    
+    else:
+        raise ValueError("지원하지 않는 MAPE 계산 방법입니다.")
+    
+    return mape_value
+
+def calculate_normalized_mape(y_true, y_pred):
+    """
+    정규화된 MAPE: 데이터 범위에 따라 정규화
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    
+    # 유효한 데이터만 선택
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true > 0)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    
+    if len(y_true_valid) == 0:
         return 0.0
-    return np.mean(np.abs((y_true[non_zero_mask] - y_pred[non_zero_mask]) / y_true[non_zero_mask])) * 100
+    
+    # 데이터 범위 계산
+    data_range = np.max(y_true_valid) - np.min(y_true_valid)
+    
+    if data_range == 0:
+        return 0.0
+    
+    # 절대 오차를 데이터 범위로 정규화
+    absolute_errors = np.abs(y_true_valid - y_pred_valid)
+    normalized_errors = absolute_errors / data_range
+    
+    # 백분율로 변환
+    return np.mean(normalized_errors) * 100
+
+
+def calculate_all_metrics(y_true, y_pred, print_details=False):
+    """
+    모든 성능 지표를 일괄 계산
+    """
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = calculate_rmse(y_true, y_pred)
+    r2 = calculate_r2(y_true, y_pred)
+    
+    # 다양한 MAPE 계산
+    mape_improved = calculate_mape(y_true, y_pred, method='improved')
+    mape_threshold = calculate_mape(y_true, y_pred, method='threshold')
+    mape_weighted = calculate_mape(y_true, y_pred, method='weighted')
+    mape_symmetric = calculate_mape(y_true, y_pred, method='symmetric')
+    mape_normalized = calculate_normalized_mape(y_true, y_pred)
+    
+    if print_details:
+        print(f"MAE: {mae:.4f}")
+        print(f"RMSE: {rmse:.4f}")
+        print(f"R²: {r2:.4f}")
+        print(f"MAPE (개선됨): {mape_improved:.2f}%")
+        print(f"MAPE (임계값): {mape_threshold:.2f}%")
+        print(f"MAPE (가중): {mape_weighted:.2f}%")
+        print(f"MAPE (대칭): {mape_symmetric:.2f}%")
+        print(f"MAPE (정규화): {mape_normalized:.2f}%")
+        
+        # 추천 MAPE 선택
+        print(f"\n추천 MAPE (개선됨): {mape_improved:.2f}%")
+    
+    return {
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'mape_improved': mape_improved,
+        'mape_threshold': mape_threshold,
+        'mape_weighted': mape_weighted,
+        'mape_symmetric': mape_symmetric,
+        'mape_normalized': mape_normalized
+    }
 
 
 def preprocess_data(data_df):
@@ -924,13 +1119,16 @@ if __name__ == "__main__":
         lstm_predictions_original = target_scaler.inverse_transform(lstm_predictions_scaled.reshape(-1, 1)).flatten()
         lstm_actuals_original = target_scaler.inverse_transform(lstm_actuals_scaled.reshape(-1, 1)).flatten()
         
-        mae_lstm = mean_absolute_error(lstm_actuals_original, lstm_predictions_original)
-        rmse_lstm = calculate_rmse(lstm_actuals_original, lstm_predictions_original)
-        mape_lstm = calculate_mape(lstm_actuals_original, lstm_predictions_original)
-        
+        lstm_metrics = calculate_all_metrics(lstm_actuals_original, lstm_predictions_original, print_details=True)
+        mae_lstm = lstm_metrics['mae']
+        rmse_lstm = lstm_metrics['rmse']   
+        r2_lstm = lstm_metrics['r2']
+        mape_lstm = lstm_metrics['mape_improved']
+
         print(f"\n=== LSTM 모델 성능 평가 ===")
         print(f"MAE: {mae_lstm:.4f}")
         print(f"RMSE: {rmse_lstm:.4f}")
+        print(f"R2: {r2_lstm:.4f}")
         print(f"MAPE: {mape_lstm:.4f}%")
         
         # GRU 예측 및 평가
@@ -938,13 +1136,16 @@ if __name__ == "__main__":
         gru_predictions_original = target_scaler.inverse_transform(gru_predictions_scaled.reshape(-1, 1)).flatten()
         gru_actuals_original = target_scaler.inverse_transform(gru_actuals_scaled.reshape(-1, 1)).flatten()
         
-        mae_gru = mean_absolute_error(gru_actuals_original, gru_predictions_original)
-        rmse_gru = calculate_rmse(gru_actuals_original, gru_predictions_original)
-        mape_gru = calculate_mape(gru_actuals_original, gru_predictions_original)
+        gru_metrics = calculate_all_metrics(gru_actuals_original, gru_predictions_original, print_details=True)
+        mae_gru = gru_metrics['mae']
+        rmse_gru = gru_metrics['rmse']
+        r2_gru = gru_metrics['r2']
+        mape_gru = gru_metrics['mape_improved']
         
         print(f"\n=== GRU 모델 성능 평가 ===")
         print(f"MAE: {mae_gru:.4f}")
         print(f"RMSE: {rmse_gru:.4f}")
+        print(f"R²: {r2_gru:.4f}")
         print(f"MAPE: {mape_gru:.4f}%")
         
         # 8. 스태킹을 위한 예측값 생성
@@ -1037,14 +1238,18 @@ if __name__ == "__main__":
         
         # 스태킹 모델 예측 및 평가
         stacked_pred_test = xgb_stacking_regressor.predict(X_test_stack)
-        
-        mae_stacked = mean_absolute_error(y_test_stack, stacked_pred_test)
-        rmse_stacked = calculate_rmse(y_test_stack, stacked_pred_test)
-        mape_stacked = calculate_mape(y_test_stack, stacked_pred_test)
+
+        # 기존 개별 메트릭 계산 → calculate_all_metrics로 변경
+        stacked_metrics = calculate_all_metrics(y_test_stack, stacked_pred_test, print_details=True)
+        mae_stacked = stacked_metrics['mae']
+        rmse_stacked = stacked_metrics['rmse']
+        r2_stacked = stacked_metrics['r2']
+        mape_stacked = stacked_metrics['mape_improved']
         
         print(f"\n=== XGBoost 스태킹 모델 성능 평가 ===")
         print(f"MAE: {mae_stacked:.4f}")
         print(f"RMSE: {rmse_stacked:.4f}")
+        print(f"R²: {r2_stacked:.4f}")
         print(f"MAPE: {mape_stacked:.4f}%")
         
         # 11. 특성 중요도 분석
