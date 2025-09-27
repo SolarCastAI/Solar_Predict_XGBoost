@@ -209,13 +209,47 @@ def calculate_normalized_mape(y_true, y_pred):
     return np.mean(normalized_errors) * 100
 
 
+def calculate_nmae(y_true, y_pred):
+    """
+    NMAE (Normalized MAE): MAE를 실제값의 범위로 정규화
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    if len(y_true_valid) == 0:
+        return 0.0
+    data_range = np.max(y_true_valid) - np.min(y_true_valid)
+    if data_range == 0:
+        return 0.0
+    mae = mean_absolute_error(y_true_valid, y_pred_valid)
+    return mae / data_range
+
+def calculate_nrmse(y_true, y_pred):
+    """
+    NRMSE (Normalized RMSE): RMSE를 실제값의 범위로 정규화
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    if len(y_true_valid) == 0:
+        return 0.0
+    data_range = np.max(y_true_valid) - np.min(y_true_valid)
+    if data_range == 0:
+        return 0.0
+    rmse = np.sqrt(mean_squared_error(y_true_valid, y_pred_valid))
+    return rmse / data_range
+
 def calculate_all_metrics(y_true, y_pred, print_details=False):
     """
     모든 성능 지표를 일괄 계산
     """
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = calculate_rmse(y_true, y_pred)
-    r2 = calculate_r2(y_true, y_pred)
+    nmae = calculate_nmae(y_true, y_pred)
+    nrmse = calculate_nrmse(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
     
     # 다양한 MAPE 계산
     mape_improved = calculate_mape(y_true, y_pred, method='improved')
@@ -225,8 +259,8 @@ def calculate_all_metrics(y_true, y_pred, print_details=False):
     mape_normalized = calculate_normalized_mape(y_true, y_pred)
     
     if print_details:
-        print(f"MAE: {mae:.4f}")
-        print(f"RMSE: {rmse:.4f}")
+        print(f"NMAE: {nmae:.4f}")
+        print(f"NRMSE: {nrmse:.4f}")
         print(f"R²: {r2:.4f}")
         print(f"MAPE (개선됨): {mape_improved:.2f}%")
         print(f"MAPE (임계값): {mape_threshold:.2f}%")
@@ -238,8 +272,8 @@ def calculate_all_metrics(y_true, y_pred, print_details=False):
         print(f"\n추천 MAPE (개선됨): {mape_improved:.2f}%")
     
     return {
-        'mae': mae,
-        'rmse': rmse,
+        'nmae': nmae,
+        'nrmse': nrmse,
         'r2': r2,
         'mape_improved': mape_improved,
         'mape_threshold': mape_threshold,
@@ -739,8 +773,9 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
     
     # 테스트 데이터에 대한 예측
     pred_test = xgb_regressor.predict(X_test)
-    mae = mean_absolute_error(y_test, pred_test)
-    rmse = calculate_rmse(y_test, pred_test)
+    nmae = calculate_nmae(y_test, pred_test)
+    nrmse = calculate_nrmse(y_test, pred_test)
+    r2 = r2_score(y_test, pred_test)
     mape = calculate_mape(y_test, pred_test)
     
     # 특성 중요도 출력
@@ -764,7 +799,7 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         plt.plot(pred_test[:200], label='Predicted', alpha=0.7)
         plt.xlabel("Time")
         plt.ylabel("발전량 (MWh)")
-        plt.title(f"XGBoost 스태킹 모델 - MAE: {mae:.3f}, RMSE: {rmse:.3f}, MAPE: {mape:.3f}%")
+        plt.title(f"XGBoost 스태킹 모델 - NMAE: {nmae:.3f}, NRMSE: {nrmse:.3f}, R2: {r2:.3f}, MAPE: {mape:.3f}%")
         plt.legend()
         
         # 산점도
@@ -798,7 +833,7 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         plt.tight_layout()
         plt.show()
         
-    return mae, rmse, mape, xgb_regressor
+    return nmae, nrmse, r2, mape, xgb_regressor
 
 def create_sequences_and_split_with_patterns(features, targets, pattern_features, 
                                             seq_len=24, test_size=0.2, val_size=0.1):
@@ -906,13 +941,15 @@ if __name__ == "__main__":
         actuals_original = target_scaler.inverse_transform(actuals_scaled.reshape(-1, 1)).flatten()
 
         lstm_metrics = calculate_all_metrics(actuals_original, predictions_original, print_details=True)
-        mae_lstm = lstm_metrics['mae']
-        rmse_lstm = lstm_metrics['rmse']
+        nmae_lstm = lstm_metrics['nmae']
+        nrmse_lstm = lstm_metrics['nrmse']
+        r2_lstm = lstm_metrics['r2']
         mape_lstm = lstm_metrics['mape_improved']
 
         print(f"\n=== LSTM 모델 성능 평가 ===")
-        print(f"MAE: {mae_lstm:.4f}")
-        print(f"RMSE: {rmse_lstm:.4f}")
+        print(f"NMAE: {nmae_lstm:.4f}")
+        print(f"NRMSE: {nrmse_lstm:.4f}")
+        print(f"R²: {r2_lstm:.4f}")
         print(f"MAPE: {mape_lstm:.4f}%")
         
         # 7. 스태킹을 위한 예측값 생성 (XGBoost의 새로운 특성)
@@ -947,25 +984,28 @@ if __name__ == "__main__":
         print("\n" + "="*60)
         print("XGBoost 스태킹 앙상블 모델 학습 시작...")
         print("="*60)
-        mae_xgb, rmse_xgb, mape_xgb, xgb_model = xgb_stacking_model(
+        nmae_xgb, nrmse_xgb, r2_xgb, mape_xgb, xgb_model = xgb_stacking_model(
             X_train_xgb, y_train_xgb, X_val_xgb, y_val_xgb, X_test_xgb, y_test_xgb, plotting=True
         )
         # XGBoost 평가도 calculate_all_metrics로 통일
         xgb_metrics = calculate_all_metrics(y_test_xgb, xgb_model.predict(X_test_xgb), print_details=True)
-        mae_xgb = xgb_metrics['mae']
-        rmse_xgb = xgb_metrics['rmse']
+        nmae_xgb = xgb_metrics['nmae']
+        nrmse_xgb = xgb_metrics['nrmse']
+        r2_xgb = xgb_metrics['r2']
         mape_xgb = xgb_metrics['mape_improved']
+
         print(f"\n=== XGBoost 스태킹 모델 성능 평가 ===")
-        print(f"MAE: {mae_xgb:.4f}")
-        print(f"RMSE: {rmse_xgb:.4f}")
+        print(f"NMAE: {nmae_xgb:.4f}")
+        print(f"NRMSE: {nrmse_xgb:.4f}")
+        print(f"R²: {r2_xgb:.4f}")
         print(f"MAPE: {mape_xgb:.4f}%")
         
         # 최종 비교
-        print(f"\n{'='*60}")
+        print(f"\n{'='*80}")
         print("최종 모델 성능 비교")
-        print(f"{'='*60}")
-        print(f"LSTM             : MAE={mae_lstm:.4f}, RMSE={rmse_lstm:.4f}, MAPE={mape_lstm:.2f}%")
-        print(f"XGBoost (Stacked): MAE={mae_xgb:.4f}, RMSE={rmse_xgb:.4f}, MAPE={mape_xgb:.2f}%")
+        print(f"{'='*80}")
+        print(f"LSTM             : NMAE={nmae_lstm:.4f}, NRMSE={nrmse_lstm:.4f}, R2={r2_lstm:.4f}, MAPE={mape_lstm:.2f}%")
+        print(f"XGBoost (Stacked): NMAE={nmae_xgb:.4f}, NRMSE={nrmse_xgb:.4f}, R2={r2_xgb:.4f}, MAPE={mape_xgb:.2f}%")
         
         # 학습 곡선 시각화
         if train_losses and val_losses:
