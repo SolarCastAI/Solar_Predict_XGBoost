@@ -205,12 +205,47 @@ def calculate_normalized_mape(y_true, y_pred):
     return np.mean(normalized_errors) * 100
 
 
+def calculate_nmae(y_true, y_pred):
+    """
+    NMAE (Normalized MAE): MAE를 실제값의 범위로 정규화
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    if len(y_true_valid) == 0:
+        return 0.0
+    data_range = np.max(y_true_valid) - np.min(y_true_valid)
+    if data_range == 0:
+        return 0.0
+    mae = mean_absolute_error(y_true_valid, y_pred_valid)
+    return mae / data_range
+
+def calculate_nrmse(y_true, y_pred):
+    """
+    NRMSE (Normalized RMSE): RMSE를 실제값의 범위로 정규화
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    if len(y_true_valid) == 0:
+        return 0.0
+    data_range = np.max(y_true_valid) - np.min(y_true_valid)
+    if data_range == 0:
+        return 0.0
+    rmse = np.sqrt(mean_squared_error(y_true_valid, y_pred_valid))
+    return rmse / data_range
+
+
 def calculate_all_metrics(y_true, y_pred, print_details=False):
     """
     모든 성능 지표를 일괄 계산
     """
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = calculate_rmse(y_true, y_pred)
+    nmae = calculate_nmae(y_true, y_pred)
+    nrmse = calculate_nrmse(y_true, y_pred)
     r2 = calculate_r2(y_true, y_pred)
     
     # 다양한 MAPE 계산
@@ -221,8 +256,8 @@ def calculate_all_metrics(y_true, y_pred, print_details=False):
     mape_normalized = calculate_normalized_mape(y_true, y_pred)
     
     if print_details:
-        print(f"MAE: {mae:.4f}")
-        print(f"RMSE: {rmse:.4f}")
+        print(f"NMAE: {nmae:.4f}")
+        print(f"NRMSE: {nrmse:.4f}")
         print(f"R²: {r2:.4f}")
         print(f"MAPE (개선됨): {mape_improved:.2f}%")
         print(f"MAPE (임계값): {mape_threshold:.2f}%")
@@ -234,8 +269,8 @@ def calculate_all_metrics(y_true, y_pred, print_details=False):
         print(f"\n추천 MAPE (개선됨): {mape_improved:.2f}%")
     
     return {
-        'mae': mae,
-        'rmse': rmse,
+        'nmae': nmae,
+        'nrmse': nrmse,
         'r2': r2,
         'mape_improved': mape_improved,
         'mape_threshold': mape_threshold,
@@ -547,8 +582,8 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
     
     # 테스트 데이터에 대한 예측
     pred_test = xgb_regressor.predict(X_test)
-    mae = mean_absolute_error(y_test, pred_test)
-    rmse = calculate_rmse(y_test, pred_test)
+    nmae = calculate_nmae(y_test, pred_test)
+    nrmse = calculate_nrmse(y_test, pred_test)
     r2 = calculate_r2(y_test, pred_test)
     mape = calculate_mape(y_test, pred_test)
     
@@ -573,7 +608,7 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         plt.plot(pred_test[:200], label='Predicted', alpha=0.7)
         plt.xlabel("Time")
         plt.ylabel("발전량 (MWh)")
-        plt.title(f"XGBoost 스태킹 모델\nMAE: {mae:.3f}, RMSE: {rmse:.3f}, R²: {r2:.3f}")
+        plt.title(f"XGBoost 스태킹 모델\nNMAE: {nmae:.3f}, NRMSE: {nrmse:.3f}, R²: {r2:.3f}")
         plt.legend()
         
         # 산점도
@@ -607,7 +642,7 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         plt.tight_layout()
         plt.show()
         
-    return mae, rmse, r2, mape, xgb_regressor
+    return nmae, nrmse, r2, mape, xgb_regressor
 
 def create_sequences_and_split_with_patterns(features, targets, pattern_features, 
                                             seq_len=24, test_size=0.2, val_size=0.1):
@@ -905,14 +940,16 @@ if __name__ == "__main__":
         gru_predictions_original = target_scaler.inverse_transform(gru_predictions_scaled.reshape(-1, 1)).flatten()
         gru_actuals_original = target_scaler.inverse_transform(gru_actuals_scaled.reshape(-1, 1)).flatten()
         
-        mae_gru = mean_absolute_error(gru_actuals_original, gru_predictions_original)
-        rmse_gru = calculate_rmse(gru_actuals_original, gru_predictions_original)
-        r2_gru = calculate_r2(gru_actuals_original, gru_predictions_original)
-        mape_gru = calculate_mape(gru_actuals_original, gru_predictions_original)
+        # 기존 개별 메트릭 계산 → calculate_all_metrics로 변경
+        gru_metrics = calculate_all_metrics(gru_actuals_original, gru_predictions_original, print_details=True)
+        nmae_gru = gru_metrics['nmae']
+        nrmse_gru = gru_metrics['nrmse']
+        r2_gru = gru_metrics['r2']
+        mape_gru = gru_metrics['mape_improved']
         
         print(f"\n=== GRU 모델 성능 평가 ===")
-        print(f"MAE: {mae_gru:.4f}")
-        print(f"RMSE: {rmse_gru:.4f}")
+        print(f"NMAE: {nmae_gru:.4f}")
+        print(f"NRMSE: {nrmse_gru:.4f}")
         print(f"R²: {r2_gru:.4f}")
         print(f"MAPE: {mape_gru:.4f}%")
         
@@ -999,14 +1036,16 @@ if __name__ == "__main__":
         # 스태킹 모델 예측 및 평가
         stacked_pred_test = xgb_stacking_regressor.predict(X_test_stack)
         
-        mae_stacked = mean_absolute_error(y_test_stack, stacked_pred_test)
-        rmse_stacked = calculate_rmse(y_test_stack, stacked_pred_test)
-        r2_stacked = calculate_r2(y_test_stack, stacked_pred_test)
-        mape_stacked = calculate_mape(y_test_stack, stacked_pred_test)
+        # 기존 개별 메트릭 계산 → calculate_all_metrics로 변경
+        stacked_metrics = calculate_all_metrics(y_test_stack, stacked_pred_test, print_details=True)
+        nmae_stacked = stacked_metrics['nmae']
+        nrmse_stacked = stacked_metrics['nrmse']
+        r2_stacked = stacked_metrics['r2']
+        mape_stacked = stacked_metrics['mape_improved']
         
         print(f"\n=== XGBoost 스태킹 모델 성능 평가 ===")
-        print(f"MAE: {mae_stacked:.4f}")
-        print(f"RMSE: {rmse_stacked:.4f}")
+        print(f"NMAE: {nmae_stacked:.4f}")
+        print(f"NRMSE: {nrmse_stacked:.4f}")
         print(f"R²: {r2_stacked:.4f}")
         print(f"MAPE: {mape_stacked:.4f}%")
         
@@ -1020,10 +1059,10 @@ if __name__ == "__main__":
         print(f"\n{'='*80}")
         print("최종 모델 성능 비교")
         print(f"{'='*80}")
-        print(f"{'모델':<20} {'MAE':<10} {'RMSE':<10} {'R²':<10} {'MAPE (%)':<10}")
+        print(f"{'모델':<20} {'NMAE':<10} {'NRMSE':<10} {'R²':<10} {'MAPE (%)':<10}")
         print("-" * 60)
-        print(f"{'GRU':<20} {mae_gru:<10.4f} {rmse_gru:<10.4f} {r2_gru:<10.4f} {mape_gru:<10.2f}")
-        print(f"{'XGBoost Stacking':<20} {mae_stacked:<10.4f} {rmse_stacked:<10.4f} {r2_stacked:<10.4f} {mape_stacked:<10.2f}")
+        print(f"{'GRU':<20} {nmae_gru:<10.4f} {nrmse_gru:<10.4f} {r2_gru:<10.4f} {mape_gru:<10.2f}")
+        print(f"{'XGBoost Stacking':<20} {nmae_stacked:<10.4f} {nrmse_stacked:<10.4f} {r2_stacked:<10.4f} {mape_stacked:<10.2f}")
         
         
         # 13. 결과 시각화
@@ -1050,7 +1089,7 @@ if __name__ == "__main__":
         plt.plot(gru_predictions_original[:test_range], label='GRU', alpha=0.7)
         plt.xlabel('Time')
         plt.ylabel('발전량 (MWh)')
-        plt.title(f'GRU 예측 결과\nMAE: {mae_gru:.3f}, R²: {r2_gru:.3f}')
+        plt.title(f'GRU 예측 결과\nNMAE: {nmae_gru:.3f}, R²: {r2_gru:.3f}')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -1059,7 +1098,7 @@ if __name__ == "__main__":
         plt.plot(stacked_pred_test[:test_range], label='Stacked', alpha=0.7)
         plt.xlabel('Time')
         plt.ylabel('발전량 (MWh)')
-        plt.title(f'XGBoost 스태킹 결과\nMAE: {mae_stacked:.3f}, R²: {r2_stacked:.3f}')
+        plt.title(f'XGBoost 스태킹 결과\nNMAE: {nmae_stacked:.3f}, R²: {r2_stacked:.3f}')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
@@ -1082,11 +1121,13 @@ if __name__ == "__main__":
         plt.ylabel('예측값')
         plt.title('Stacked: 실제값 vs 예측값')
         plt.grid(True, alpha=0.3)
-        
+        # for debug
+        # print("feature_names 길이:", len(feature_names))
+        # print("feature_importances_ 길이:", len(xgb_stacking_regressor.feature_importances_))
         # 4. 특성 중요도
         plt.subplot(3, 4, 9)
         importance_df = pd.DataFrame({
-            'feature': list(importance_dict.keys()),
+            'feature': feature_names,
             'importance': xgb_stacking_regressor.feature_importances_
         }).sort_values('importance', ascending=True)
         
@@ -1123,8 +1164,8 @@ if __name__ == "__main__":
         plt.figure(figsize=(20, 5))
         
         models = ['GRU', 'XGBoost\nStacking']
-        mae_scores = [mae_gru, mae_stacked]
-        rmse_scores = [rmse_gru, rmse_stacked]
+        nmae_scores = [nmae_gru, nmae_stacked]
+        nrmse_scores = [nrmse_gru, nrmse_stacked]
         r2_scores = [r2_gru, r2_stacked]
         mape_scores = [mape_gru, mape_stacked]
         
@@ -1132,18 +1173,18 @@ if __name__ == "__main__":
         width = 0.25
         
         plt.subplot(1, 4, 1)
-        plt.bar(x, mae_scores, width, label='MAE', alpha=0.8)
+        plt.bar(x, nmae_scores, width, label='NMAE', alpha=0.8)
         plt.xlabel('모델')
-        plt.ylabel('MAE')
-        plt.title('MAE 비교')
+        plt.ylabel('NMAE')
+        plt.title('NMAE 비교')
         plt.xticks(x, models)
         plt.grid(True, alpha=0.3)
         
         plt.subplot(1, 4, 2)
-        plt.bar(x, rmse_scores, width, label='RMSE', alpha=0.8, color='orange')
+        plt.bar(x, nrmse_scores, width, label='NRMSE', alpha=0.8, color='orange')
         plt.xlabel('모델')
-        plt.ylabel('RMSE')
-        plt.title('RMSE 비교')
+        plt.ylabel('NRMSE')
+        plt.title('NRMSE 비교')
         plt.xticks(x, models)
         plt.grid(True, alpha=0.3)
         
