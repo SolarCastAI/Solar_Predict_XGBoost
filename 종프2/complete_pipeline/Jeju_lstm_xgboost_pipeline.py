@@ -17,6 +17,11 @@ from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 import xgboost as xgb
 from xgboost import plot_importance
+import joblib
+import json
+import zipfile
+import tempfile
+import shutil
 
 # GPU/CUDA 설정
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -835,37 +840,146 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         
     return nmae, nrmse, r2, mape, xgb_regressor
 
-def create_sequences_and_split_with_patterns(features, targets, pattern_features, 
-                                            seq_len=24, test_size=0.2, val_size=0.1):
+# --- 추가된 코드: CombinedModel (저장/불러오기) ---
+class CombinedModel:
     """
-    패턴 정보를 포함한 시퀀스 데이터 생성 및 분할
+    Holds trained LSTM (state_dict), XGBoost sklearn XGBRegressor, scalers and PatternExtractor.
+    save(path) -> single zip file with:
+      - lstm_state.pth
+      - xgb_model.json
+      - scalers.pkl
+      - pattern_extractor.pkl
+      - metadata.json (seq_len, lstm params)
+    load(path, device) -> CombinedModel
     """
-    # 스케일링 (기상 피처와 타겟만 스케일)
-    feature_scaler = MinMaxScaler()
-    target_scaler = MinMaxScaler()
-    
-    features_scaled = feature_scaler.fit_transform(features)
-    targets_scaled = target_scaler.fit_transform(targets.reshape(-1, 1)).flatten()
-    
-    # pattern_features의 첫 열은 '패턴 라벨' (정수)
-    # 절대 스케일링하지 않고 정수로 유지
-    patterns = pattern_features[:, 0].astype(int)  # e.g. 0,1,2,...,n_patterns-1
-    
-    # 데이터셋 생성
-    dataset = SolarPatternDataset(features_scaled, targets_scaled, patterns, seq_len)
-    
-    # 데이터 분할 (비율 기반)
-    dataset_size = len(dataset)
-    test_split = int(dataset_size * test_size)
-    val_split = int(dataset_size * val_size)
-    train_split = dataset_size - test_split - val_split
-    
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_split, val_split, test_split]
-    )
-    
-    return (train_dataset, val_dataset, test_dataset, 
-            feature_scaler, target_scaler)
+    def __init__(self, lstm_model=None, xgb_model=None,
+                 feature_scaler=None, target_scaler=None,
+                 pattern_extractor=None, seq_len=24, lstm_hparams=None, device=None):
+        self.lstm_model = lstm_model
+        self.xgb_model = xgb_model
+        self.feature_scaler = feature_scaler
+        self.target_scaler = target_scaler
+        self.pattern_extractor = pattern_extractor
+        self.seq_len = seq_len
+        self.lstm_hparams = lstm_hparams or {}
+        self.device = device if device is not None else torch.device('cpu')
+
+    def save(self, zip_path):
+        tmp = tempfile.mkdtemp()
+        try:
+            # save lstm state_dict
+            lstm_path = os.path.join(tmp, "lstm_state.pth")
+            torch.save(self.lstm_model.state_dict(), lstm_path)
+
+            # save xgboost model (sklearn API XGBRegressor)
+            xgb_path = os.path.join(tmp, "xgb_model.json")
+            try:
+                # XGBRegressor has save_model
+                self.xgb_model.save_model(xgb_path)
+            except Exception:
+                # fallback to joblib for any picklable object
+                joblib.dump(self.xgb_model, os.path.join(tmp, "xgb_model.joblib"))
+                xgb_path = os.path.join(tmp, "xgb_model.joblib")
+
+            # save scalers and pattern extractor
+            joblib.dump({
+                'feature_scaler': self.feature_scaler,
+                'target_scaler': self.target_scaler
+            }, os.path.join(tmp, "scalers.pkl"))
+            joblib.dump(self.pattern_extractor, os.path.join(tmp, "pattern_extractor.pkl"))
+
+            # metadata
+            meta = {
+                'seq_len': self.seq_len,
+                'lstm_hparams': self.lstm_hparams
+            }
+            with open(os.path.join(tmp, "metadata.json"), 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+
+            # create zip
+            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+                for fname in os.listdir(tmp):
+                    z.write(os.path.join(tmp, fname), arcname=fname)
+        finally:
+            shutil.rmtree(tmp)
+
+    @classmethod
+    def load(cls, zip_path, device=None):
+        tmp = tempfile.mkdtemp()
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as z:
+                z.extractall(tmp)
+
+            # load metadata
+            with open(os.path.join(tmp, "metadata.json"), 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            seq_len = meta.get('seq_len', 24)
+            lstm_hparams = meta.get('lstm_hparams', {})
+
+            # load scalers and pattern_extractor
+            scalers = joblib.load(os.path.join(tmp, "scalers.pkl"))
+            feature_scaler = scalers.get('feature_scaler')
+            target_scaler = scalers.get('target_scaler')
+            pattern_extractor = joblib.load(os.path.join(tmp, "pattern_extractor.pkl"))
+
+            # reconstruct LSTM model and load state
+            # assumes LSTM_Pattern class available in module scope
+            lstm_model = LSTM_Pattern(**lstm_hparams)
+            state_path = os.path.join(tmp, "lstm_state.pth")
+            state_dict = torch.load(state_path, map_location=device if device is not None else 'cpu')
+            lstm_model.load_state_dict(state_dict)
+            lstm_model.to(device if device is not None else torch.device('cpu'))
+            lstm_model.eval()
+
+            # load xgb model
+            xgb_json = os.path.join(tmp, "xgb_model.json")
+            xgb_joblib = os.path.join(tmp, "xgb_model.joblib")
+            if os.path.exists(xgb_json):
+                xgb_model = xgb.XGBRegressor()
+                xgb_model.load_model(xgb_json)
+            elif os.path.exists(xgb_joblib):
+                xgb_model = joblib.load(xgb_joblib)
+            else:
+                raise FileNotFoundError("No xgboost model file found in pipeline zip.")
+
+            return cls(
+                lstm_model=lstm_model,
+                xgb_model=xgb_model,
+                feature_scaler=feature_scaler,
+                target_scaler=target_scaler,
+                pattern_extractor=pattern_extractor,
+                seq_len=seq_len,
+                lstm_hparams=lstm_hparams,
+                device=device
+            )
+        finally:
+            shutil.rmtree(tmp)
+
+    def predict_with_lstm(self, features_seq):
+        """
+        features_seq: numpy (seq_len, 4) raw scale -> predict using loaded LSTM, returns original-scale scalar
+        """
+        arr = np.asarray(features_seq, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != 4:
+            raise ValueError("features_seq must be shape (seq_len, 4)")
+        # ensure length
+        if arr.shape[0] < self.seq_len:
+            pad_n = self.seq_len - arr.shape[0]
+            pad_rows = np.repeat(arr[0:1, :], pad_n, axis=0)
+            arr = np.vstack([pad_rows, arr])
+        elif arr.shape[0] > self.seq_len:
+            arr = arr[-self.seq_len:, :]
+
+        patterns = self.pattern_extractor.get_pattern_features(arr)
+        pattern_seq = patterns.reshape(-1, 1).astype(np.float32)
+        scaled_weather = self.feature_scaler.transform(arr)
+        combined = np.concatenate([scaled_weather.astype(np.float32), pattern_seq], axis=1)
+        tensor = torch.tensor(combined).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            out = self.lstm_model(tensor)
+        pred_scaled = out.cpu().numpy().ravel()
+        val = pred_scaled.item() if pred_scaled.size == 1 else pred_scaled[-1]
+        return self.target_scaler.inverse_transform(np.array(val).reshape(-1, 1)).flatten()[0]
 
 if __name__ == "__main__":
     try:
@@ -1030,6 +1144,31 @@ if __name__ == "__main__":
             plt.tight_layout()
             plt.show()
         
+        # after training and after xgb_model fitted (near end of training pipeline)
+        # create and save combined pipeline
+        try:
+            combined = CombinedModel(
+                lstm_model=model,           # trained LSTM_Pattern instance
+                xgb_model=xgb_model,        # trained XGBRegressor from earlier XGBoost training step
+                feature_scaler=feature_scaler,
+                target_scaler=target_scaler,
+                pattern_extractor=pattern_extractor,
+                seq_len=seq_len,
+                lstm_hparams={
+                    'weather_feature_dim': 4,
+                    'pattern_embedding_dim': 8,
+                    'hidden_dim': 128,
+                    'num_layers': 2,
+                    'n_patterns': 5
+                },
+                device=device
+            )
+            save_path = os.path.join(os.getcwd(), "lstm_xgb_pipeline.zip")
+            combined.save(save_path)
+            print(f"\nCombined pipeline saved to: {save_path}")
+        except Exception as e:
+            print("Combined pipeline 저장 중 오류:", e)
+
     except FileNotFoundError:
         print(f"Error: 파일을 찾을 수 없습니다. 경로를 확인해주세요: {data_path}")
     except Exception as e:

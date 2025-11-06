@@ -17,6 +17,11 @@ from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 import xgboost as xgb
 from xgboost import plot_importance
+import joblib
+import json
+import zipfile
+import tempfile
+import shutil
 
 
 
@@ -837,6 +842,64 @@ def xgb_stacking_model(X_train, y_train, X_val, y_val, X_test, y_test, plotting=
         
     return nmae, nrmse, r2, mape_improved, xgb_regressor
 
+# --- 추가: CombinedModel 저장/로드 유틸리티 및 통합 저장 함수 ---
+class CombinedModel:
+	"""
+	저장 대상: LSTM state_dict, GRU state_dict, XGBoost 모델, scalers, pattern_extractor, metadata
+	save(zip_path) 으로 하나의 zip 파일 생성
+	"""
+	def __init__(self, lstm_model=None, gru_model=None, xgb_model=None,
+				 feature_scaler=None, target_scaler=None, pattern_extractor=None,
+				 seq_len=24, lstm_hparams=None, gru_hparams=None, device=None):
+		self.lstm_model = lstm_model
+		self.gru_model = gru_model
+		self.xgb_model = xgb_model
+		self.feature_scaler = feature_scaler
+		self.target_scaler = target_scaler
+		self.pattern_extractor = pattern_extractor
+		self.seq_len = seq_len
+		self.lstm_hparams = lstm_hparams or {}
+		self.gru_hparams = gru_hparams or {}
+		self.device = device if device is not None else torch.device('cpu')
+
+	def save(self, zip_path):
+		tmp = tempfile.mkdtemp()
+		try:
+			# LSTM/GRU state_dict
+			torch.save(self.lstm_model.state_dict(), os.path.join(tmp, "lstm_state.pth"))
+			torch.save(self.gru_model.state_dict(), os.path.join(tmp, "gru_state.pth"))
+
+			# XGBoost 모델 (가능하면 JSON, 아니면 joblib)
+			xgb_json = os.path.join(tmp, "xgb_model.json")
+			try:
+				self.xgb_model.save_model(xgb_json)
+				xgb_saved = "xgb_model.json"
+			except Exception:
+				joblib.dump(self.xgb_model, os.path.join(tmp, "xgb_model.joblib"))
+				xgb_saved = "xgb_model.joblib"
+
+			# scalers & pattern_extractor
+			joblib.dump({'feature_scaler': self.feature_scaler, 'target_scaler': self.target_scaler},
+						os.path.join(tmp, "scalers.pkl"))
+			joblib.dump(self.pattern_extractor, os.path.join(tmp, "pattern_extractor.pkl"))
+
+			# metadata
+			meta = {
+				'seq_len': self.seq_len,
+				'lstm_hparams': self.lstm_hparams,
+				'gru_hparams': self.gru_hparams,
+				'xgb_file': xgb_saved
+			}
+			with open(os.path.join(tmp, "metadata.json"), 'w', encoding='utf-8') as f:
+				json.dump(meta, f, ensure_ascii=False, indent=2)
+
+			# zip
+			with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+				for fname in os.listdir(tmp):
+					z.write(os.path.join(tmp, fname), arcname=fname)
+		finally:
+			shutil.rmtree(tmp)
+
 def create_sequences_and_split_with_patterns(features, targets, pattern_features, 
                                             seq_len=24, test_size=0.2, val_size=0.1):
     """
@@ -1484,6 +1547,34 @@ if __name__ == "__main__":
         print(f"\n{'='*80}")
         print("모델 학습 및 평가 완료!")
         print(f"{'='*80}")
+        
+        # 저장: 통합 모델(zip) 생성 및 테스트 출력
+        try:
+            combined = CombinedModel(
+                lstm_model=lstm_model,
+                gru_model=gru_model,
+                xgb_model=xgb_stacking_regressor,
+                feature_scaler=feature_scaler,
+                target_scaler=target_scaler,
+                pattern_extractor=pattern_extractor,
+                seq_len=seq_len,
+                lstm_hparams={'weather_feature_dim':4,'pattern_embedding_dim':8,'hidden_dim':128,'num_layers':2,'n_patterns':5},
+                gru_hparams={'weather_feature_dim':4,'pattern_embedding_dim':8,'hidden_dim':128,'num_layers':2,'n_patterns':5},
+                device=device
+            )
+            save_path = os.path.join(os.getcwd(), "lstm_gru_xgb_pipeline.zip")
+            combined.save(save_path)
+            print(f"\n✅ 통합 모델 파일 저장됨: {save_path}")
+
+            # 간단한 테스트 출력: 스택된 예측값 일부와 실제값 출력
+            print("\n--- Test 샘플 (Actual vs Stacked Prediction) ---")
+            show_n = min(10, len(y_test_stack))
+            for i in range(show_n):
+                actual = y_test_stack[i]
+                pred = stacked_pred_test[i]
+                print(f"idx {i:3d} | Actual: {actual:.4f} | Pred: {pred:.4f}")
+        except Exception as e:
+            print("통합 모델 저장/출력 중 오류:", e)
         
     except FileNotFoundError:
         print(f"Error: 파일을 찾을 수 없습니다. 경로를 확인해주세요: {data_path}")
