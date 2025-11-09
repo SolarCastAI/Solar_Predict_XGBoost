@@ -331,8 +331,6 @@ def predict_solar_generation(new_data, models_dict, sequence_length=24):
     stacked_predictions = xgb_model.predict(X_stacked).reshape(-1, 1)
     
     return {
-        'lstm_predictions': lstm_predictions.flatten(),
-        'gru_predictions': gru_predictions.flatten(),
         'stacked_predictions': stacked_predictions.flatten(),
         'n_predictions': len(stacked_predictions)
     }
@@ -369,15 +367,11 @@ def predict_current_hour(current_data, models_dict, current_datetime, sequence_l
     # 가장 마지막 예측값이 현재 시점의 예측
     current_prediction = {
         'datetime': current_datetime,
-        'lstm': float(predictions['lstm_predictions'][-1]),
-        'gru': float(predictions['gru_predictions'][-1]),
         'stacked': float(predictions['stacked_predictions'][-1])
     }
     
     print(f"\n📊 현재 시점 예측 결과:")
-    print(f"  • LSTM:    {current_prediction['lstm']:.2f} MWh")
-    print(f"  • GRU:     {current_prediction['gru']:.2f} MWh")
-    print(f"  • Stacked: {current_prediction['stacked']:.2f} MWh")
+    print(f"  • 예측 발전량: {current_prediction['stacked']:.2f} MWh")
     
     return current_prediction
 
@@ -402,8 +396,6 @@ def predict_n_hours_ahead(current_data, models_dict, hours_ahead=24, sequence_le
     
     # 마지막 N개 예측값 추출 (N시간 후 예측)
     future_predictions = {
-        'lstm': predictions['lstm_predictions'][-hours_ahead:],
-        'gru': predictions['gru_predictions'][-hours_ahead:],
         'stacked': predictions['stacked_predictions'][-hours_ahead:],
         'hours_ahead': hours_ahead
     }
@@ -440,9 +432,7 @@ def predict_multiple_horizons_realtime(current_data, models_dict, current_dateti
     current_df = pd.DataFrame([{
         '예측일시': current_datetime,
         '예측시간': '현재',
-        'LSTM_예측(MWh)': current_pred['lstm'],
-        'GRU_예측(MWh)': current_pred['gru'],
-        'Stacked_예측(MWh)': current_pred['stacked']
+        '예측발전량(MWh)': current_pred['stacked']
     }])
     
     current_csv = os.path.join(output_dir, 'prediction_current.csv')
@@ -465,7 +455,7 @@ def predict_multiple_horizons_realtime(current_data, models_dict, current_dateti
             # 예측 수행
             predictions = predict_n_hours_ahead(
                 current_data=current_data,
-                models_dict=models_dict,
+                models_dict=models,
                 hours_ahead=hours,
                 sequence_length=sequence_length
             )
@@ -481,15 +471,11 @@ def predict_multiple_horizons_realtime(current_data, models_dict, current_dateti
             df = pd.DataFrame({
                 '예측시간': time_labels,
                 '예측일시': datetime_labels,
-                'LSTM_예측(MWh)': predictions['lstm'],
-                'GRU_예측(MWh)': predictions['gru'],
-                'Stacked_예측(MWh)': predictions['stacked']
+                '예측발전량(MWh)': predictions['stacked']
             })
             
             # 누적 발전량 계산
-            df['LSTM_누적(MWh)'] = df['LSTM_예측(MWh)'].cumsum()
-            df['GRU_누적(MWh)'] = df['GRU_예측(MWh)'].cumsum()
-            df['Stacked_누적(MWh)'] = df['Stacked_예측(MWh)'].cumsum()
+            df['누적발전량(MWh)'] = df['예측발전량(MWh)'].cumsum()
             
             # CSV 파일로 저장
             csv_filename = f'prediction_{hours}H_{current_datetime.strftime("%Y%m%d_%H%M")}.csv'
@@ -498,23 +484,18 @@ def predict_multiple_horizons_realtime(current_data, models_dict, current_dateti
             
             print(f"  ✅ {hours}시간 예측 완료")
             print(f"  💾 파일 저장: {csv_path}")
-            print(f"  📈 총 예측 발전량 (Stacked): {predictions['stacked'].sum():.2f} MWh")
-            print(f"  📊 시간당 평균 (Stacked): {predictions['stacked'].mean():.2f} MWh")
+            print(f"  📈 총 예측 발전량: {predictions['stacked'].sum():.2f} MWh")
+            print(f"  📊 시간당 평균: {predictions['stacked'].mean():.2f} MWh")
             
             # 결과 저장
             results[f'{hours}H'] = {
                 'dataframe': df,
                 'csv_path': csv_path,
                 'summary': {
-                    'lstm_total': float(predictions['lstm'].sum()),
-                    'gru_total': float(predictions['gru'].sum()),
-                    'stacked_total': float(predictions['stacked'].sum()),
-                    'lstm_mean': float(predictions['lstm'].mean()),
-                    'gru_mean': float(predictions['gru'].mean()),
-                    'stacked_mean': float(predictions['stacked'].mean()),
-                    'lstm_max': float(predictions['lstm'].max()),
-                    'gru_max': float(predictions['gru'].max()),
-                    'stacked_max': float(predictions['stacked'].max()),
+                    'total': float(predictions['stacked'].sum()),
+                    'mean': float(predictions['stacked'].mean()),
+                    'max': float(predictions['stacked'].max()),
+                    'min': float(predictions['stacked'].min())
                 }
             }
             
@@ -529,9 +510,8 @@ def predict_multiple_horizons_realtime(current_data, models_dict, current_dateti
     
     summary_data = [{
         '예측구간': '현재',
-        'LSTM_발전량(MWh)': current_pred['lstm'],
-        'GRU_발전량(MWh)': current_pred['gru'],
-        'Stacked_발전량(MWh)': current_pred['stacked'],
+        '예측발전량(MWh)': current_pred['stacked'],
+        '누적발전량(MWh)': current_pred['stacked']
     }]
     
     for hours in [24, 48, 72]:
@@ -539,9 +519,8 @@ def predict_multiple_horizons_realtime(current_data, models_dict, current_dateti
             summary = results[f'{hours}H']['summary']
             summary_data.append({
                 '예측구간': f'{hours}시간',
-                'LSTM_발전량(MWh)': summary['lstm_total'],
-                'GRU_발전량(MWh)': summary['gru_total'],
-                'Stacked_발전량(MWh)': summary['stacked_total'],
+                '예측발전량(MWh)': summary['total'],
+                '누적발전량(MWh)': summary['total']
             })
     
     summary_df = pd.DataFrame(summary_data)
