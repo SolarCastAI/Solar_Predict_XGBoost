@@ -107,7 +107,7 @@ def load_trained_models(model_dir='./saved_models', timestamp=None):
     
     # LSTM 모델 로드
     lstm_path = os.path.join(model_dir, f'lstm_model_{timestamp}.pth')
-    lstm_checkpoint = torch.load(lstm_path, map_location=device)
+    lstm_checkpoint = torch.load(lstm_path, map_location=device, weights_only=False)
     lstm_config = lstm_checkpoint['model_config']
     
     lstm_model = LSTMModel(
@@ -121,7 +121,7 @@ def load_trained_models(model_dir='./saved_models', timestamp=None):
     
     # GRU 모델 로드
     gru_path = os.path.join(model_dir, f'gru_model_{timestamp}.pth')
-    gru_checkpoint = torch.load(gru_path, map_location=device)
+    gru_checkpoint = torch.load(gru_path, map_location=device, weights_only=False)
     gru_config = gru_checkpoint['model_config']
     
     gru_model = GRUModel(
