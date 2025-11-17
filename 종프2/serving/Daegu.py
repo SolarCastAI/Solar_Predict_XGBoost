@@ -332,7 +332,7 @@ def load_jeju_pretrained_models(model_dir='./saved_models', timestamp=None):
     
     # LSTM 모델 로드
     lstm_path = os.path.join(model_dir, f'lstm_model_{timestamp}.pth')
-    lstm_checkpoint = torch.load(lstm_path, map_location=device)
+    lstm_checkpoint = torch.load(lstm_path, map_location=device, weights_only=False)
     lstm_config = lstm_checkpoint['model_config']
     
     lstm_model = LSTMModel(
@@ -345,7 +345,7 @@ def load_jeju_pretrained_models(model_dir='./saved_models', timestamp=None):
     
     # GRU 모델 로드
     gru_path = os.path.join(model_dir, f'gru_model_{timestamp}.pth')
-    gru_checkpoint = torch.load(gru_path, map_location=device)
+    gru_checkpoint = torch.load(gru_path, map_location=device, weights_only=False)
     gru_config = gru_checkpoint['model_config']
     
     gru_model = GRUModel(
@@ -577,28 +577,33 @@ if __name__ == "__main__":
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
         
-        # 4. LSTM 전이학습
-        print("\n" + "="*80)
-        print("LSTM 전이학습 (대구)")
-        print("="*80)
-        
-        criterion = nn.MSELoss()
-        lstm_model, lstm_train_losses, lstm_val_losses = transfer_learning(
-            lstm_pretrained, train_loader, val_loader, criterion,
-            num_epochs=50, patience=10, learning_rate=0.0001,
-            freeze_layers=False, device=device, model_name='LSTM'
-        )
-        
-        # 5. GRU 전이학습
-        print("\n" + "="*80)
-        print("GRU 전이학습 (대구)")
-        print("="*80)
-        
-        gru_model, gru_train_losses, gru_val_losses = transfer_learning(
-            gru_pretrained, train_loader, val_loader, criterion,
-            num_epochs=50, patience=10, learning_rate=0.0001,
-            freeze_layers=False, device=device, model_name='GRU'
-        )
+        if device.type == 'cuda':
+            # 4. LSTM 전이학습
+            print("\n" + "="*80)
+            print("LSTM 전이학습 (대구)")
+            print("="*80)
+            
+            criterion = nn.MSELoss()
+            lstm_model, lstm_train_losses, lstm_val_losses = transfer_learning(
+                lstm_pretrained, train_loader, val_loader, criterion,
+                num_epochs=50, patience=10, learning_rate=0.0001,
+                freeze_layers=False, device=device, model_name='LSTM'
+            )
+            
+            # 5. GRU 전이학습
+            print("\n" + "="*80)
+            print("GRU 전이학습 (대구)")
+            print("="*80)
+            
+            gru_model, gru_train_losses, gru_val_losses = transfer_learning(
+                gru_pretrained, train_loader, val_loader, criterion,
+                num_epochs=50, patience=10, learning_rate=0.0001,
+                freeze_layers=False, device=device, model_name='GRU'
+            )
+        else:
+            lstm_model = lstm_pretrained
+            gru_model = gru_pretrained
+            print("\n⚠️  CPU 환경에서는 전이학습을 건너뜁니다.")
         
         # 6. 미래 발전량 예측 (24H, 48H, 72H)
         print("\n" + "="*80)
