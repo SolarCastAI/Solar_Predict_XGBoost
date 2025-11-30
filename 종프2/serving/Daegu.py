@@ -332,7 +332,7 @@ def load_jeju_pretrained_models(model_dir='./saved_models', timestamp=None):
     
     # LSTM 모델 로드
     lstm_path = os.path.join(model_dir, f'lstm_model_{timestamp}.pth')
-    lstm_checkpoint = torch.load(lstm_path, map_location=device, weights_only=False)
+    lstm_checkpoint = torch.load(lstm_path, map_location=device)
     lstm_config = lstm_checkpoint['model_config']
     
     lstm_model = LSTMModel(
@@ -345,7 +345,7 @@ def load_jeju_pretrained_models(model_dir='./saved_models', timestamp=None):
     
     # GRU 모델 로드
     gru_path = os.path.join(model_dir, f'gru_model_{timestamp}.pth')
-    gru_checkpoint = torch.load(gru_path, map_location=device, weights_only=False)
+    gru_checkpoint = torch.load(gru_path, map_location=device)
     gru_config = gru_checkpoint['model_config']
     
     gru_model = GRUModel(
@@ -545,6 +545,95 @@ def predict_future(model, scaler_X, scaler_y, last_sequence,
     
     return max(0, prediction), new_sequence
 
+# === 전이학습 모델 저장 함수 수정 ===
+def save_transfer_models(lstm_model, gru_model, scaler_X, scaler_y, 
+                        lstm_metrics, gru_metrics, 
+                        region_name, model_dir='./saved_models'):
+    """
+    전이학습된 모델 저장
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_dir = os.path.join(model_dir, f'transfer_{region_name}')
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # ⭐ Metrics를 JSON 직렬화 가능한 형태로 변환
+    def convert_to_native(obj):
+        """NumPy 타입을 Python 네이티브 타입으로 변환"""
+        if isinstance(obj, dict):
+            return {key: convert_to_native(value) for key, value in obj.items()}
+        elif isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
+    
+    lstm_metrics_native = convert_to_native(lstm_metrics)
+    gru_metrics_native = convert_to_native(gru_metrics)
+    
+    # LSTM 모델 저장
+    lstm_path = os.path.join(save_dir, f'lstm_transfer_{region_name}_{timestamp}.pth')
+    torch.save({
+        'model_state_dict': lstm_model.state_dict(),
+        'model_config': {
+            'input_size': lstm_model.lstm.input_size,
+            'hidden_size': lstm_model.hidden_size,
+            'num_layers': lstm_model.num_layers
+        },
+        'metrics': lstm_metrics_native,
+        'timestamp': timestamp,
+        'region': region_name
+    }, lstm_path)
+    print(f"✅ LSTM 전이학습 모델 저장: {lstm_path}")
+    
+    # GRU 모델 저장
+    gru_path = os.path.join(save_dir, f'gru_transfer_{region_name}_{timestamp}.pth')
+    torch.save({
+        'model_state_dict': gru_model.state_dict(),
+        'model_config': {
+            'input_size': gru_model.gru.input_size,
+            'hidden_size': gru_model.hidden_size,
+            'num_layers': gru_model.num_layers
+        },
+        'metrics': gru_metrics_native,
+        'timestamp': timestamp,
+        'region': region_name
+    }, gru_path)
+    print(f"✅ GRU 전이학습 모델 저장: {gru_path}")
+    
+    # 스케일러 저장
+    scaler_path = os.path.join(save_dir, f'scalers_{region_name}_{timestamp}.pkl')
+    with open(scaler_path, 'wb') as f:
+        pickle.dump({'scaler_X': scaler_X, 'scaler_y': scaler_y}, f)
+    print(f"✅ 스케일러 저장: {scaler_path}")
+    
+    # 메타데이터 저장
+    metadata = {
+        'timestamp': timestamp,
+        'region': region_name,
+        'lstm_metrics': lstm_metrics_native,
+        'gru_metrics': gru_metrics_native,
+        'models': {
+            'lstm': lstm_path,
+            'gru': gru_path,
+            'scalers': scaler_path
+        }
+    }
+    
+    metadata_path = os.path.join(save_dir, f'metadata_{region_name}_{timestamp}.json')
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    print(f"✅ 메타데이터 저장: {metadata_path}")
+    
+    # 최신 모델 정보 저장
+    latest_path = os.path.join(save_dir, f'latest_model_{region_name}.json')
+    with open(latest_path, 'w', encoding='utf-8') as f:
+        json.dump({'timestamp': timestamp, 'region': region_name}, f, indent=2)
+    
+    return timestamp
+
 # === 메인 실행 ===
 if __name__ == "__main__":
     try:
@@ -577,33 +666,28 @@ if __name__ == "__main__":
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
         test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
         
-        if device.type == 'cuda':
-            # 4. LSTM 전이학습
-            print("\n" + "="*80)
-            print("LSTM 전이학습 (대구)")
-            print("="*80)
-            
-            criterion = nn.MSELoss()
-            lstm_model, lstm_train_losses, lstm_val_losses = transfer_learning(
-                lstm_pretrained, train_loader, val_loader, criterion,
-                num_epochs=50, patience=10, learning_rate=0.0001,
-                freeze_layers=False, device=device, model_name='LSTM'
-            )
-            
-            # 5. GRU 전이학습
-            print("\n" + "="*80)
-            print("GRU 전이학습 (대구)")
-            print("="*80)
-            
-            gru_model, gru_train_losses, gru_val_losses = transfer_learning(
-                gru_pretrained, train_loader, val_loader, criterion,
-                num_epochs=50, patience=10, learning_rate=0.0001,
-                freeze_layers=False, device=device, model_name='GRU'
-            )
-        else:
-            lstm_model = lstm_pretrained
-            gru_model = gru_pretrained
-            print("\n⚠️  CPU 환경에서는 전이학습을 건너뜁니다.")
+        # 4. LSTM 전이학습
+        print("\n" + "="*80)
+        print("LSTM 전이학습 (대구)")
+        print("="*80)
+        
+        criterion = nn.MSELoss()
+        lstm_model, lstm_train_losses, lstm_val_losses = transfer_learning(
+            lstm_pretrained, train_loader, val_loader, criterion,
+            num_epochs=50, patience=10, learning_rate=0.0001,
+            freeze_layers=False, device=device, model_name='LSTM'
+        )
+        
+        # 5. GRU 전이학습
+        print("\n" + "="*80)
+        print("GRU 전이학습 (대구)")
+        print("="*80)
+        
+        gru_model, gru_train_losses, gru_val_losses = transfer_learning(
+            gru_pretrained, train_loader, val_loader, criterion,
+            num_epochs=50, patience=10, learning_rate=0.0001,
+            freeze_layers=False, device=device, model_name='GRU'
+        )
         
         # 6. 미래 발전량 예측 (24H, 48H, 72H)
         print("\n" + "="*80)
@@ -703,12 +787,69 @@ if __name__ == "__main__":
         print(f"\n{'='*80}")
         print("대구 전이학습 및 미래 예측 완료!")
         print(f"{'='*80}")
-        print(f"\n✨ 제주 백본 모델을 로드하여 대구 데이터로 전이학습 완료")
-        print(f"📈 전이학습된 모델로 24H, 48H, 72H 후 발전량 예측 완료")
-        print(f"\n💡 참고:")
-        print(f"  - 전이학습된 모델은 별도로 저장하지 않았습니다")
-        print(f"  - LSTM과 GRU의 앙상블 예측을 권장합니다")
-        print(f"  - 실제 기상 조건에 따라 발전량은 달라질 수 있습니다")
+
+        # 기존 코드의 6번 섹션 이후에 추가
+
+        # 7. 테스트 세트 평가 및 모델 저장
+        print("\n" + "="*80)
+        print("테스트 세트 평가")
+        print("="*80)
+        
+        # LSTM 평가
+        lstm_predictions, lstm_actuals = predict(lstm_model, test_loader, device)
+        lstm_predictions_original = scaler_y.inverse_transform(lstm_predictions)
+        lstm_actuals_original = scaler_y.inverse_transform(lstm_actuals)
+        
+        lstm_metrics = calculate_all_metrics(
+            lstm_actuals_original, lstm_predictions_original, print_details=True
+        )
+        
+        print("\n[LSTM 전이학습 모델 성능]")
+        print(f"  MAE: {lstm_metrics['mae']:.4f} MWh")
+        print(f"  RMSE: {lstm_metrics['rmse']:.4f} MWh")
+        print(f"  R²: {lstm_metrics['r2']:.4f}")
+        print(f"  MAPE: {lstm_metrics['mape']:.2f}%")
+        
+        # GRU 평가
+        gru_predictions, gru_actuals = predict(gru_model, test_loader, device)
+        gru_predictions_original = scaler_y.inverse_transform(gru_predictions)
+        gru_actuals_original = scaler_y.inverse_transform(gru_actuals)
+        
+        gru_metrics = calculate_all_metrics(
+            gru_actuals_original, gru_predictions_original, print_details=True
+        )
+        
+        print("\n[GRU 전이학습 모델 성능]")
+        print(f"  MAE: {gru_metrics['mae']:.4f} MWh")
+        print(f"  RMSE: {gru_metrics['rmse']:.4f} MWh")
+        print(f"  R²: {gru_metrics['r2']:.4f}")
+        print(f"  MAPE: {gru_metrics['mape']:.2f}%")
+        
+        # 앙상블 평가
+        ensemble_predictions = (lstm_predictions_original + gru_predictions_original) / 2
+        ensemble_metrics = calculate_all_metrics(
+            lstm_actuals_original, ensemble_predictions, print_details=True
+        )
+        
+        print("\n[앙상블 (LSTM+GRU) 성능]")
+        print(f"  MAE: {ensemble_metrics['mae']:.4f} MWh")
+        print(f"  RMSE: {ensemble_metrics['rmse']:.4f} MWh")
+        print(f"  R²: {ensemble_metrics['r2']:.4f}")
+        print(f"  MAPE: {ensemble_metrics['mape']:.2f}%")
+        
+        # 8. 전이학습 모델 저장
+        print("\n" + "="*80)
+        print("전이학습 모델 저장")
+        print("="*80)
+        
+        saved_timestamp = save_transfer_models(
+            lstm_model, gru_model, scaler_X, scaler_y,
+            lstm_metrics, gru_metrics,
+            region_name='daegu',
+            model_dir=model_dir
+        )
+        
+        print(f"\n✅ 대구 전이학습 모델 저장 완료! (Timestamp: {saved_timestamp})")
         
     except FileNotFoundError as e:
         print(f"Error: 파일을 찾을 수 없습니다. {e}")

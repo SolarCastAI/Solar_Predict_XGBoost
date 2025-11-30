@@ -1,0 +1,25 @@
+{
+  "timestamp": "20251130_161022",
+  "region": "daegu",
+  "lstm_metrics": {
+    "mae": 1.420735478401184,
+    "rmse": 2.5726081776464444,
+    "r2": 0.9437308311462402,
+    "mape": 17.033802006390854,
+    "nmae": 0.023199984803795815,
+    "nrmse": 0.042009557768155036
+  },
+  "gru_metrics": {
+    "mae": 1.4365403652191162,
+    "rmse": 2.5725164269459464,
+    "r2": 0.943734884262085,
+    "mape": 16.614009227949055,
+    "nmae": 0.023458071053028107,
+    "nrmse": 0.04200805951965131
+  },
+  "models": {
+    "lstm": "./saved_models/transfer_daegu/lstm_transfer_daegu_20251130_161022.pth",
+    "gru": "./saved_models/transfer_daegu/gru_transfer_daegu_20251130_161022.pth",
+    "scalers": "./saved_models/transfer_daegu/scalers_daegu_20251130_161022.pkl"
+  }
+}
