@@ -5,7 +5,7 @@ import numpy as np
 import pickle
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
@@ -361,11 +361,154 @@ def predict(model, test_loader, device='cpu'):
     return np.array(predictions), np.array(actuals)
 
 
+# ==========================================
+# ⭐ 미래 예측 함수 (현재 날짜 기준, 시간별 누적 발전량 포함)
+# ==========================================
+def predict_future_single_step(model, scaler_X, scaler_y, last_sequence, 
+                                target_time, solar_capacity, device='cpu'):
+    """
+    단일 시점 미래 예측 (1시간 후)
+    """
+    model.eval()
+    
+    # 마지막 시퀀스의 평균값으로 다음 시점 특성 추정
+    last_features = last_sequence[-1].copy()
+    
+    # 시간 특성 업데이트 (hour)
+    target_hour = target_time.hour
+    hour_scaled = target_hour / 23.0  # MinMax 스케일링 근사
+    last_features[7] = hour_scaled  # hour는 8번째 특성
+    
+    # 새 시퀀스 생성 (sliding window)
+    new_sequence = np.vstack([last_sequence[1:], last_features.reshape(1, -1)])
+    
+    # 예측
+    with torch.no_grad():
+        X_tensor = torch.FloatTensor(new_sequence).unsqueeze(0).to(device)
+        pred_scaled = model(X_tensor).cpu().numpy()
+        pred_original = scaler_y.inverse_transform(pred_scaled)[0, 0]
+    
+    return max(0, pred_original), new_sequence
+
+
+def generate_future_predictions(lstm_model, gru_model, scaler_X, scaler_y, 
+                                 X_test, df_valid, device='cpu'):
+    """
+    24H, 48H, 72H 미래 예측 생성 (현재 날짜 기준, 시간별 현재/누적 발전량 포함)
+    """
+    print("\n" + "="*80)
+    print("🔮 미래 예측 생성 중 (24H, 48H, 72H)...")
+    print("="*80)
+    
+    # 마지막 시퀀스 선택
+    last_sequence = X_test[-1].copy()
+    
+    # ⭐ 현재 날짜/시간 기준으로 설정
+    current_time = datetime.now()
+    print(f"현재 시간: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    solar_capacity = df_valid['solar_capacity'].iloc[0]
+    
+    predictions_list = []
+    
+    # 누적 발전량 추적 변수
+    lstm_cumulative = 0
+    gru_cumulative = 0
+    ensemble_cumulative = 0
+    
+    # 72시간 예측
+    for hour in range(1, 73):
+        target_time = current_time + timedelta(hours=hour)
+        
+        # LSTM 예측
+        lstm_pred, last_sequence = predict_future_single_step(
+            lstm_model, scaler_X, scaler_y, last_sequence,
+            target_time, solar_capacity, device
+        )
+        
+        # GRU 예측
+        gru_pred, _ = predict_future_single_step(
+            gru_model, scaler_X, scaler_y, last_sequence,
+            target_time, solar_capacity, device
+        )
+        
+        # 앙상블 (평균)
+        ensemble_pred = (lstm_pred + gru_pred) / 2
+        
+        # 누적 발전량 업데이트
+        lstm_cumulative += lstm_pred
+        gru_cumulative += gru_pred
+        ensemble_cumulative += ensemble_pred
+        
+        predictions_list.append({
+            '예측_날짜': target_time.strftime('%Y-%m-%d'),
+            '예측_시간': target_time.strftime('%H:%M'),
+            '예측_일시': target_time.strftime('%Y-%m-%d %H:%M:%S'),
+            '경과_시간(H)': hour,
+            'LSTM_현재_발전량(MWh)': round(lstm_pred, 4),
+            'LSTM_누적_발전량(MWh)': round(lstm_cumulative, 4),
+            'GRU_현재_발전량(MWh)': round(gru_pred, 4),
+            'GRU_누적_발전량(MWh)': round(gru_cumulative, 4),
+            '앙상블_현재_발전량(MWh)': round(ensemble_pred, 4),
+            '앙상블_누적_발전량(MWh)': round(ensemble_cumulative, 4)
+        })
+        
+        if hour % 24 == 0:
+            print(f"  {hour}H 예측 완료 (누적: 앙상블 {ensemble_cumulative:.2f} MWh)")
+    
+    return pd.DataFrame(predictions_list)
+
+
+def save_prediction_csvs(predictions_df, output_dir='./prediction_results'):
+    """
+    24H, 48H, 72H 예측 결과를 별도 CSV 파일로 저장 (시간별 현재/누적 발전량 포함)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 24H 예측
+    pred_24h = predictions_df[predictions_df['경과_시간(H)'] <= 24].copy()
+    file_24h = os.path.join(output_dir, f'prediction_24H_{timestamp}.csv')
+    pred_24h.to_csv(file_24h, index=False, encoding='utf-8-sig')
+    print(f"✅ 24H 예측 저장: {file_24h}")
+    print(f"   - 총 {len(pred_24h)}개 시간별 데이터")
+    print(f"   - 누적 발전량(앙상블): {pred_24h['앙상블_누적_발전량(MWh)'].iloc[-1]:.2f} MWh")
+    
+    # 48H 예측
+    pred_48h = predictions_df[predictions_df['경과_시간(H)'] <= 48].copy()
+    file_48h = os.path.join(output_dir, f'prediction_48H_{timestamp}.csv')
+    pred_48h.to_csv(file_48h, index=False, encoding='utf-8-sig')
+    print(f"✅ 48H 예측 저장: {file_48h}")
+    print(f"   - 총 {len(pred_48h)}개 시간별 데이터")
+    print(f"   - 누적 발전량(앙상블): {pred_48h['앙상블_누적_발전량(MWh)'].iloc[-1]:.2f} MWh")
+    
+    # 72H 예측
+    pred_72h = predictions_df.copy()
+    file_72h = os.path.join(output_dir, f'prediction_72H_{timestamp}.csv')
+    pred_72h.to_csv(file_72h, index=False, encoding='utf-8-sig')
+    print(f"✅ 72H 예측 저장: {file_72h}")
+    print(f"   - 총 {len(pred_72h)}개 시간별 데이터")
+    print(f"   - 누적 발전량(앙상블): {pred_72h['앙상블_누적_발전량(MWh)'].iloc[-1]:.2f} MWh")
+    
+    # 전체 예측 (통합본)
+    file_all = os.path.join(output_dir, f'prediction_ALL_{timestamp}.csv')
+    predictions_df.to_csv(file_all, index=False, encoding='utf-8-sig')
+    print(f"✅ 전체 예측 저장: {file_all}")
+    
+    return {
+        '24H': file_24h,
+        '48H': file_48h,
+        '72H': file_72h,
+        'ALL': file_all
+    }
+
+
 # === 메인 실행 ===
 if __name__ == "__main__":
     try:
         print("\n" + "="*80)
-        print("🔥 대구 전이학습 모델의 부산 데이터 성능 평가")
+        print("🔥 대구 전이학습 모델의 부산 데이터 성능 평가 + 미래 예측")
         print("="*80)
         
         # 1. 대구 전이학습 모델 로드
@@ -432,7 +575,30 @@ if __name__ == "__main__":
             lstm_actuals_original, ensemble_predictions, print_details=True
         )
         
-        # 7. 최종 요약
+        # ==========================================
+        # ⭐ 7. 미래 예측 생성 (24H, 48H, 72H) - 현재 날짜 기준
+        # ==========================================
+        predictions_df = generate_future_predictions(
+            lstm_model, gru_model, scaler_X, scaler_y,
+            X_test, df_valid, device
+        )
+        
+        # ==========================================
+        # ⭐ 8. 예측 결과 CSV 저장 (시간별 현재/누적 발전량 포함)
+        # ==========================================
+        print("\n" + "="*80)
+        print("💾 예측 결과 CSV 저장 중...")
+        print("="*80)
+        
+        saved_files = save_prediction_csvs(predictions_df, output_dir='./prediction_results')
+        
+        print("\n" + "="*80)
+        print("📁 저장된 파일 목록:")
+        print("="*80)
+        for period, filepath in saved_files.items():
+            print(f"  [{period:>3}] {filepath}")
+        
+        # 9. 최종 요약
         print("\n" + "="*80)
         print("📊 성능 비교 요약")
         print("="*80)
@@ -446,26 +612,22 @@ if __name__ == "__main__":
         print(f"  GRU       - R²: {gru_metrics['r2']:.4f}, NMAE: {gru_metrics['nmae']:.4f}, MAPE: {gru_metrics['mape']:.2f}%")
         print(f"  앙상블    - R²: {ensemble_metrics['r2']:.4f}, NMAE: {ensemble_metrics['nmae']:.4f}, MAPE: {ensemble_metrics['mape']:.2f}%")
         
+        # 10. 예측 샘플 출력
         print("\n" + "="*80)
-        print("✅ 평가 완료!")
+        print("🔮 미래 예측 샘플 (처음 10시간)")
         print("="*80)
+        print(predictions_df.head(10)[['예측_일시', '경과_시간(H)', '앙상블_현재_발전량(MWh)', '앙상블_누적_발전량(MWh)']].to_string(index=False))
         
-        # 8. 샘플 예측 출력
         print("\n" + "="*80)
-        print("🔍 샘플 예측 결과 (처음 10개)")
+        print("🔮 미래 예측 요약")
         print("="*80)
-        print(f"{'실제값 (MWh)':>15} {'LSTM 예측':>15} {'GRU 예측':>15} {'앙상블 예측':>15} {'오차(앙상블)':>15}")
-        print("-" * 80)
+        print(f"24H 후 누적 발전량: {predictions_df[predictions_df['경과_시간(H)'] == 24]['앙상블_누적_발전량(MWh)'].values[0]:.2f} MWh")
+        print(f"48H 후 누적 발전량: {predictions_df[predictions_df['경과_시간(H)'] == 48]['앙상블_누적_발전량(MWh)'].values[0]:.2f} MWh")
+        print(f"72H 후 누적 발전량: {predictions_df[predictions_df['경과_시간(H)'] == 72]['앙상블_누적_발전량(MWh)'].values[0]:.2f} MWh")
         
-        for i in range(min(10, len(lstm_actuals_original))):
-            actual = lstm_actuals_original[i, 0]
-            lstm_pred = lstm_predictions_original[i, 0]
-            gru_pred = gru_predictions_original[i, 0]
-            ensemble_pred = ensemble_predictions[i, 0]
-            error = abs(actual - ensemble_pred)
-            
-            print(f"{actual:>15.2f} {lstm_pred:>15.2f} {gru_pred:>15.2f} "
-                  f"{ensemble_pred:>15.2f} {error:>15.2f}")
+        print("\n" + "="*80)
+        print("✅ 모든 작업 완료!")
+        print("="*80)
         
     except FileNotFoundError as e:
         print(f"\n❌ 에러: {e}")
