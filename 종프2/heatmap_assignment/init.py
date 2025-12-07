@@ -2,8 +2,8 @@
 계절별 기상 패턴 클러스터링 및 도로 열위험도 예측
 - 태양광 발전 데이터를 활용한 계절별 K-means 클러스터링
 - LSTM_Pattern / GRU_Pattern 모델
-- XGBoost 스태킹 앙상블
-- 평가지표: NMAE, R²
+- XGBoost 스태킹 앙상블 (개선)
+- 평가지표: NMAE, R², MAPE, Accuracy
 """
 
 import pandas as pd
@@ -54,6 +54,40 @@ def calculate_nmae(y_true, y_pred):
         return 0.0
     mae = mean_absolute_error(y_true_valid, y_pred_valid)
     return mae / data_range
+
+def calculate_mape(y_true, y_pred):
+    """
+    MAPE (Mean Absolute Percentage Error): 평균 절대 백분율 오차
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true != 0)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    if len(y_true_valid) == 0:
+        return 0.0
+    return np.mean(np.abs((y_true_valid - y_pred_valid) / y_true_valid)) * 100
+
+def calculate_accuracy_within_threshold(y_true, y_pred, threshold_percent=10):
+    """
+    임계값 내 정확도: 예측값이 실제값의 ±threshold% 이내에 있는 비율
+    도로별 열위험도 예측 정확도 90% 이상 목표
+    """
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true != 0)
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    if len(y_true_valid) == 0:
+        return 0.0
+    
+    # 상대 오차 계산
+    relative_error = np.abs((y_true_valid - y_pred_valid) / y_true_valid) * 100
+    
+    # 임계값 이내 비율
+    within_threshold = (relative_error <= threshold_percent).sum() / len(y_true_valid) * 100
+    
+    return within_threshold
 
 
 class SolarDataPreprocessor:
@@ -867,70 +901,118 @@ class TimeSeriesDataGenerator:
 
 
 def train_xgboost_stacking(base_predictions_train, y_train, base_predictions_val, y_val, 
-                           base_predictions_test, y_test):
-    """XGBoost 스태킹 모델 학습 및 평가"""
+                           base_predictions_test, y_test, X_train_features, X_val_features, X_test_features):
+    """XGBoost 스태킹 모델 학습 및 평가 (개선 버전)"""
     print("\n" + "=" * 80)
-    print("12. XGBoost 스태킹 모델 학습")
+    print("12. XGBoost 스태킹 모델 학습 (개선)")
     print("=" * 80)
     
+    # 기본 모델의 예측값 + 원본 특성 결합
+    print("\n특성 결합 중...")
+    train_features = np.column_stack([base_predictions_train, X_train_features])
+    val_features = np.column_stack([base_predictions_val, X_val_features])
+    test_features = np.column_stack([base_predictions_test, X_test_features])
+    
+    print(f"Train features shape: {train_features.shape}")
+    print(f"Val features shape: {val_features.shape}")
+    print(f"Test features shape: {test_features.shape}")
+    
+    # XGBoost 하이퍼파라미터 최적화
     xgb_model = xgb.XGBRegressor(
-        gamma=0.5, 
-        n_estimators=300, 
-        learning_rate=0.08, 
-        max_depth=6,
-        min_child_weight=3,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=200,           # 적당한 트리 수
+        learning_rate=0.05,         # 낮은 학습률로 안정성 확보
+        max_depth=4,                # 깊이 제한으로 과적합 방지
+        min_child_weight=5,         # 리프 노드 최소 샘플 수 증가
+        subsample=0.8,              # 샘플 서브샘플링
+        colsample_bytree=0.8,       # 특성 서브샘플링
+        gamma=0.1,                  # 분할 최소 손실 감소
+        reg_alpha=0.05,             # L1 정규화
+        reg_lambda=1.0,             # L2 정규화
         random_state=42,
-        reg_alpha=0.1,
-        reg_lambda=0.1
+        objective='reg:squarederror',
+        early_stopping_rounds=20,   # early_stopping_rounds를 여기로 이동
+        enable_categorical=False    # 범주형 특성 비활성화
     )
     
-    print("XGBoost 학습 중...")
+    print("\nXGBoost 학습 중...")
     xgb_model.fit(
-        base_predictions_train, 
+        train_features, 
         y_train, 
-        eval_set=[(base_predictions_val, y_val)], 
+        eval_set=[(val_features, y_val)],
         verbose=False
     )
     
-    pred_train = xgb_model.predict(base_predictions_train)
-    pred_val = xgb_model.predict(base_predictions_val)
-    pred_test = xgb_model.predict(base_predictions_test)
+    # 예측
+    pred_train = xgb_model.predict(train_features)
+    pred_val = xgb_model.predict(val_features)
+    pred_test = xgb_model.predict(test_features)
     
+    # 평가 지표 계산
     train_nmae = calculate_nmae(y_train, pred_train)
     train_r2 = calculate_r2(y_train, pred_train)
+    train_mape = calculate_mape(y_train, pred_train)
+    train_acc = calculate_accuracy_within_threshold(y_train, pred_train, threshold_percent=10)
     
     val_nmae = calculate_nmae(y_val, pred_val)
     val_r2 = calculate_r2(y_val, pred_val)
+    val_mape = calculate_mape(y_val, pred_val)
+    val_acc = calculate_accuracy_within_threshold(y_val, pred_val, threshold_percent=10)
     
     test_nmae = calculate_nmae(y_test, pred_test)
     test_r2 = calculate_r2(y_test, pred_test)
+    test_mape = calculate_mape(y_test, pred_test)
+    test_acc = calculate_accuracy_within_threshold(y_test, pred_test, threshold_percent=10)
     
     print("\n=== XGBoost 스태킹 모델 성능 ===")
-    print(f"Train - NMAE: {train_nmae:.4f}, R²: {train_r2:.4f}")
-    print(f"Val   - NMAE: {val_nmae:.4f}, R²: {val_r2:.4f}")
-    print(f"Test  - NMAE: {test_nmae:.4f}, R²: {test_r2:.4f}")
+    print(f"\n{'Dataset':<10} {'NMAE':<10} {'R²':<10} {'MAPE(%)':<12} {'Accuracy(%)':>15}")
+    print("-" * 65)
+    print(f"{'Train':<10} {train_nmae:<10.4f} {train_r2:<10.4f} {train_mape:<12.2f} {train_acc:>15.2f}")
+    print(f"{'Val':<10} {val_nmae:<10.4f} {val_r2:<10.4f} {val_mape:<12.2f} {val_acc:>15.2f}")
+    print(f"{'Test':<10} {test_nmae:<10.4f} {test_r2:<10.4f} {test_mape:<12.2f} {test_acc:>15.2f}")
     
-    feature_names = ['LSTM_예측값', 'GRU_예측값']
+    # KPI 체크
+    print("\n=== KPI 체크 ===")
+    kpi_threshold = 90.0
+    if test_acc >= kpi_threshold:
+        print(f"✓ KPI 달성: 도로별 열위험도 예측 정확도 {test_acc:.2f}% (목표: {kpi_threshold}% 이상)")
+    else:
+        print(f"✗ KPI 미달: 도로별 열위험도 예측 정확도 {test_acc:.2f}% (목표: {kpi_threshold}% 이상)")
+        print(f"  개선 필요: {kpi_threshold - test_acc:.2f}%p 부족")
+    
+    # 특성 중요도
+    feature_names = ['LSTM_예측값', 'GRU_예측값'] + [f'원본특성_{i+1}' for i in range(train_features.shape[1] - 2)]
     importance_dict = dict(zip(feature_names, xgb_model.feature_importances_))
-    print("\n특성 중요도:")
-    for feature, importance in sorted(importance_dict.items(), key=lambda x: x[1], reverse=True):
-        print(f"  {feature}: {importance:.4f}")
     
-    return xgb_model, pred_test, test_nmae, test_r2
-
+    print("\n특성 중요도 (Top 10):")
+    for i, (feature, importance) in enumerate(sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:10], 1):
+        print(f"  {i}. {feature}: {importance:.4f}")
+    
+    return xgb_model, pred_test, {
+        'NMAE': test_nmae,
+        'R2': test_r2,
+        'MAPE': test_mape,
+        'Accuracy': test_acc
+    }
 
 def evaluate_model(y_true, y_pred, model_name):
-    """모델 성능 평가"""
+    """모델 성능 평가 (개선 버전)"""
     nmae = calculate_nmae(y_true, y_pred)
     r2 = calculate_r2(y_true, y_pred)
+    mape = calculate_mape(y_true, y_pred)
+    accuracy = calculate_accuracy_within_threshold(y_true, y_pred, threshold_percent=10)
     
     print(f"\n{model_name} 성능:")
-    print(f"  NMAE: {nmae:.4f}")
-    print(f"  R²:   {r2:.4f}")
+    print(f"  NMAE:        {nmae:.4f}")
+    print(f"  R²:          {r2:.4f}")
+    print(f"  MAPE:        {mape:.2f}%")
+    print(f"  Accuracy:    {accuracy:.2f}% (±10% 오차 이내)")
     
-    return {'NMAE': nmae, 'R2': r2}
+    return {
+        'NMAE': nmae,
+        'R2': r2,
+        'MAPE': mape,
+        'Accuracy': accuracy
+    }
 
 
 def main():
@@ -1061,37 +1143,66 @@ def main():
     
     gru_results = evaluate_model(y_test, gru_pred_test, "GRU_Pattern")
     
-    # 9. XGBoost 스태킹
+    # 9. XGBoost 스태킹용 추가 특성 준비
+    # 마지막 타임스텝의 특성 사용
+    X_train_last = X_train_scaled[:, -1, :4]  # 기온, 습도, 시간_sin, 시간_cos
+    X_val_last = X_val_scaled[:, -1, :4]
+    X_test_last = X_test_scaled[:, -1, :4]
+    
     base_predictions_train = np.column_stack([lstm_pred_train, gru_pred_train])
     base_predictions_val = np.column_stack([lstm_pred_val, gru_pred_val])
     base_predictions_test = np.column_stack([lstm_pred_test, gru_pred_test])
     
-    xgb_model, xgb_pred_test, test_nmae, test_r2 = train_xgboost_stacking(
+    # 10. XGBoost 스태킹 (개선)
+    xgb_model, xgb_pred_test, xgb_results = train_xgboost_stacking(
         base_predictions_train, y_train,
         base_predictions_val, y_val,
-        base_predictions_test, y_test
+        base_predictions_test, y_test,
+        X_train_last, X_val_last, X_test_last
     )
     
-    # 10. 최종 결과 요약
+    # 11. 최종 결과 요약
     print("\n" + "=" * 80)
     print("13. 최종 성능 요약")
     print("=" * 80)
-    print(f"\n{'모델':<30} {'NMAE':<12} {'R²':<12}")
-    print("-" * 80)
-    print(f"{'LSTM_Pattern':<30} {lstm_results['NMAE']:<12.4f} {lstm_results['R2']:<12.4f}")
-    print(f"{'GRU_Pattern':<30} {gru_results['NMAE']:<12.4f} {gru_results['R2']:<12.4f}")
-    print(f"{'XGBoost Stacking':<30} {test_nmae:<12.4f} {test_r2:<12.4f}")
+    print(f"\n{'모델':<30} {'NMAE':<12} {'R²':<12} {'MAPE(%)':<12} {'Accuracy(%)':>15}")
+    print("-" * 85)
+    print(f"{'LSTM_Pattern':<30} {lstm_results['NMAE']:<12.4f} {lstm_results['R2']:<12.4f} "
+          f"{lstm_results['MAPE']:<12.2f} {lstm_results['Accuracy']:>15.2f}")
+    print(f"{'GRU_Pattern':<30} {gru_results['NMAE']:<12.4f} {gru_results['R2']:<12.4f} "
+          f"{gru_results['MAPE']:<12.2f} {gru_results['Accuracy']:>15.2f}")
+    print(f"{'XGBoost Stacking (개선)':<30} {xgb_results['NMAE']:<12.4f} {xgb_results['R2']:<12.4f} "
+          f"{xgb_results['MAPE']:<12.2f} {xgb_results['Accuracy']:>15.2f}")
     
-    # 11. 모델 저장
+    # KPI 최종 확인
     print("\n" + "=" * 80)
-    print("14. 모델 저장")
+    print("14. KPI 최종 확인")
+    print("=" * 80)
+    kpi_target = 90.0
+    best_model = max(
+        [('LSTM_Pattern', lstm_results['Accuracy']),
+         ('GRU_Pattern', gru_results['Accuracy']),
+         ('XGBoost Stacking', xgb_results['Accuracy'])],
+        key=lambda x: x[1]
+    )
+    
+    print(f"\n최고 성능 모델: {best_model[0]} ({best_model[1]:.2f}%)")
+    if best_model[1] >= kpi_target:
+        print(f"✓ 전체 KPI 달성: {best_model[1]:.2f}% ≥ {kpi_target}%")
+    else:
+        print(f"✗ 전체 KPI 미달: {best_model[1]:.2f}% < {kpi_target}%")
+        print(f"  개선 필요: {kpi_target - best_model[1]:.2f}%p")
+    
+    # 12. 모델 저장
+    print("\n" + "=" * 80)
+    print("15. 모델 저장")
     print("=" * 80)
     
-    torch.save(lstm_model.state_dict(), 'lstm_pattern_seasonal_model.pth')
-    torch.save(gru_model.state_dict(), 'gru_pattern_seasonal_model.pth')
+    torch.save(lstm_model.state_dict(), './heatmap_prediction/lstm_pattern_seasonal_model.pth')
+    torch.save(gru_model.state_dict(), './heatmap_prediction/gru_pattern_seasonal_model.pth')
     print("\n모델 저장 완료:")
-    print("- lstm_pattern_seasonal_model.pth")
-    print("- gru_pattern_seasonal_model.pth")
+    print("- ./heatmap_prediction/lstm_pattern_seasonal_model.pth")
+    print("- ./heatmap_prediction/gru_pattern_seasonal_model.pth")
     
     print("\n" + "=" * 80)
     print("분석 완료!")
