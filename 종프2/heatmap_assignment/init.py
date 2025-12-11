@@ -1,8 +1,8 @@
 """
-계절별 기상 패턴 클러스터링 및 도로 열위험도 예측
+계절별 기상 패턴 클러스터링 및 도로 열위험도 예측 (과적합 방지 개선)
 - 태양광 발전 데이터를 활용한 계절별 K-means 클러스터링
-- LSTM_Pattern / GRU_Pattern 모델
-- XGBoost 스태킹 앙상블 (개선)
+- LSTM_Pattern / GRU_Pattern 모델 (정규화 강화)
+- XGBoost 스태킹 앙상블
 - 평가지표: NMAE, R², MAPE, Accuracy
 """
 
@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import mean_absolute_error, r2_score
 import torch
 import torch.nn as nn
@@ -34,14 +34,24 @@ plt.rcParams['axes.unicode_minus'] = False
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"사용 디바이스: {device}")
 
+# 재현성을 위한 시드 설정
+def set_seed(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
 # 평가 지표 함수 
 def calculate_r2(y_true, y_pred):
     return r2_score(y_true, y_pred)
 
 def calculate_nmae(y_true, y_pred):
-    """
-    NMAE (Normalized MAE): MAE를 실제값의 범위로 정규화
-    """
+    """NMAE (Normalized MAE): MAE를 실제값의 범위로 정규화"""
     y_true = np.array(y_true, dtype=np.float64)
     y_pred = np.array(y_pred, dtype=np.float64)
     valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
@@ -56,9 +66,7 @@ def calculate_nmae(y_true, y_pred):
     return mae / data_range
 
 def calculate_mape(y_true, y_pred):
-    """
-    MAPE (Mean Absolute Percentage Error): 평균 절대 백분율 오차
-    """
+    """MAPE (Mean Absolute Percentage Error): 평균 절대 백분율 오차"""
     y_true = np.array(y_true, dtype=np.float64)
     y_pred = np.array(y_pred, dtype=np.float64)
     valid_mask = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true != 0)
@@ -69,10 +77,7 @@ def calculate_mape(y_true, y_pred):
     return np.mean(np.abs((y_true_valid - y_pred_valid) / y_true_valid)) * 100
 
 def calculate_accuracy_within_threshold(y_true, y_pred, threshold_percent=10):
-    """
-    임계값 내 정확도: 예측값이 실제값의 ±threshold% 이내에 있는 비율
-    도로별 열위험도 예측 정확도 90% 이상 목표
-    """
+    """임계값 내 정확도: 예측값이 실제값의 ±threshold% 이내에 있는 비율"""
     y_true = np.array(y_true, dtype=np.float64)
     y_pred = np.array(y_pred, dtype=np.float64)
     valid_mask = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true != 0)
@@ -81,10 +86,7 @@ def calculate_accuracy_within_threshold(y_true, y_pred, threshold_percent=10):
     if len(y_true_valid) == 0:
         return 0.0
     
-    # 상대 오차 계산
     relative_error = np.abs((y_true_valid - y_pred_valid) / y_true_valid) * 100
-    
-    # 임계값 이내 비율
     within_threshold = (relative_error <= threshold_percent).sum() / len(y_true_valid) * 100
     
     return within_threshold
@@ -119,45 +121,36 @@ class SolarDataPreprocessor:
         
         initial_rows = len(df)
         
-        # 결측치 확인
         print("\n결측치 현황:")
         print(df.isnull().sum())
         
-        # 발전일자를 datetime으로 변환
         df['발전일자'] = pd.to_datetime(df['발전일자'], errors='coerce')
         df = df.dropna(subset=['발전일자'])
         
-        # 기온 이상치 처리 (-30°C ~ 50°C 범위)
         if '기온' in df.columns:
             print(f"\n기온 범위: {df['기온'].min():.1f}°C ~ {df['기온'].max():.1f}°C")
             df.loc[(df['기온'] < -30) | (df['기온'] > 50), '기온'] = np.nan
         
-        # 습도 이상치 처리 (0% ~ 100% 범위)
         if '습도' in df.columns:
             valid_humidity = df['습도'].notna()
             if valid_humidity.sum() > 0:
                 print(f"습도 범위: {df.loc[valid_humidity, '습도'].min():.1f}% ~ {df.loc[valid_humidity, '습도'].max():.1f}%")
             df.loc[(df['습도'] < 0) | (df['습도'] > 100), '습도'] = np.nan
         
-        # 강우량 음수 제거
         if '강우량(mm)' in df.columns:
             df.loc[df['강우량(mm)'] < 0, '강우량(mm)'] = 0
         
-        # 적설량 음수 제거
         if '적설량(mm)' in df.columns:
             df.loc[df['적설량(mm)'] < 0, '적설량(mm)'] = 0
         
-        # 풍속 음수 제거
         if '풍속' in df.columns:
             df.loc[df['풍속'] < 0, '풍속'] = 0
         
-        # 선형 보간
         numeric_cols = ['기온', '강우량(mm)', '습도', '적설량(mm)', '풍속', '적운량(10분위)', '적운량(3분위)']
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = df[col].interpolate(method='linear', limit=3)
         
-        # 여전히 결측치가 있는 행 제거
         df = df.dropna(subset=['기온'])
         
         print(f"\n처리 완료: {initial_rows} -> {len(df)} rows ({initial_rows - len(df)} rows 제거)")
@@ -175,11 +168,9 @@ class SolarDataPreprocessor:
         df['월'] = df['발전일자'].dt.month
         df['일'] = df['발전일자'].dt.day
         
-        # 계절 구분 (3-5월: 봄, 6-8월: 여름, 9-11월: 가을, 12-2월: 겨울)
         df['계절'] = df['월'].apply(lambda x: (x % 12 + 3) // 3)
         df['계절명'] = df['계절'].map({1: '봄', 2: '여름', 3: '가을', 4: '겨울'})
         
-        # 주기성을 위한 sin/cos 변환
         df['시간_sin'] = np.sin(2 * np.pi * df['시간'] / 24)
         df['시간_cos'] = np.cos(2 * np.pi * df['시간'] / 24)
         df['월_sin'] = np.sin(2 * np.pi * df['월'] / 12)
@@ -206,10 +197,8 @@ class SeasonalWeatherPatternClustering:
         print("4. 계절별 K-means 클러스터링 - 기상 패턴 분석")
         print("=" * 80)
         
-        # 클러스터링에 사용할 특성
         cluster_features = ['기온', '강우량(mm)', '습도', '적설량(mm)', '풍속', '적운량(10분위)']
         
-        # 결측치를 평균으로 채우기
         for col in cluster_features:
             if col in df.columns:
                 df[f'{col}_filled'] = df[col].fillna(df[col].mean())
@@ -218,7 +207,6 @@ class SeasonalWeatherPatternClustering:
         
         cluster_features_filled = [f'{col}_filled' for col in cluster_features]
         
-        # 계절별로 클러스터링 수행
         df['기상패턴'] = -1
         
         for season_name in ['봄', '여름', '가을', '겨울']:
@@ -229,25 +217,20 @@ class SeasonalWeatherPatternClustering:
                 print(f"\n{season_name}: 데이터가 부족하여 클러스터링 건너뜀")
                 continue
             
-            # 정규화
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(season_data)
             
-            # K-means 클러스터링
             kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
             cluster_labels = kmeans.fit_predict(X_scaled)
             
-            # 계절별 클러스터 레이블을 고유하게 만들기 (계절*10 + 클러스터)
             season_num = {'봄': 1, '여름': 2, '가을': 3, '겨울': 4}[season_name]
             unique_labels = season_num * 10 + cluster_labels
             
             df.loc[season_mask, '기상패턴'] = unique_labels
             
-            # 모델 저장
             self.seasonal_kmeans[season_name] = kmeans
             self.seasonal_scalers[season_name] = scaler
             
-            # 클러스터별 특성 분석
             print(f"\n{season_name} 계절 클러스터 (총 {len(season_data)}개 데이터):")
             print("-" * 80)
             
@@ -259,11 +242,7 @@ class SeasonalWeatherPatternClustering:
                     print(f"    기온: {df.loc[cluster_mask, '기온_filled'].mean():.1f}°C")
                     print(f"    강우량: {df.loc[cluster_mask, '강우량(mm)_filled'].mean():.2f}mm")
                     print(f"    습도: {df.loc[cluster_mask, '습도_filled'].mean():.1f}%")
-                    print(f"    적설량: {df.loc[cluster_mask, '적설량(mm)_filled'].mean():.2f}mm")
-                    print(f"    풍속: {df.loc[cluster_mask, '풍속_filled'].mean():.2f}m/s")
-                    print(f"    적운량: {df.loc[cluster_mask, '적운량(10분위)_filled'].mean():.1f}")
         
-        # 패턴이 할당되지 않은 경우 처리
         df.loc[df['기상패턴'] == -1, '기상패턴'] = 0
         
         print(f"\n전체 기상패턴 분포:")
@@ -285,17 +264,13 @@ class RoadDataPreprocessor:
         print("5. 도로 데이터 로드 및 파싱")
         print("=" * 80)
         
-        # CSV 파일 읽기
         df = pd.read_csv(filepath, encoding='utf-8-sig')
         
-        # 데이터 구조 분석
         print(f"\n원본 데이터 shape: {df.shape}")
         print(f"컬럼: {df.columns.tolist()}")
         
-        # 4개의 데이터 소스로 분리
         data_frames = []
         
-        # 1. 기상청 데이터 (첫 4개 컬럼)
         if len(df.columns) >= 4:
             weather_df = df.iloc[:, 0:4].copy()
             weather_df.columns = ['일시', '기온', '습도', '지점명']
@@ -303,7 +278,6 @@ class RoadDataPreprocessor:
             data_frames.append(weather_df)
             print(f"\n기상청 데이터: {len(weather_df)} rows")
         
-        # 2. IoT 센서 데이터 (다음 4개 컬럼)
         if len(df.columns) >= 8:
             iot_df = df.iloc[:, 4:8].copy()
             iot_df.columns = ['일시', '기온', '습도', '지점명']
@@ -311,7 +285,6 @@ class RoadDataPreprocessor:
             data_frames.append(iot_df)
             print(f"IoT 센서 데이터: {len(iot_df)} rows")
         
-        # 3. 데이터로거 1367 (다음 3개 컬럼)
         if len(df.columns) >= 11:
             logger1_df = df.iloc[:, 8:11].copy()
             logger1_df.columns = ['일시', '기온', '지점명']
@@ -320,7 +293,6 @@ class RoadDataPreprocessor:
             data_frames.append(logger1_df)
             print(f"데이터로거 1367: {len(logger1_df)} rows")
         
-        # 4. 데이터로거 1368 (나머지 컬럼)
         if len(df.columns) >= 14:
             logger2_df = df.iloc[:, 11:14].copy()
             logger2_df.columns = ['일시', '기온', '지점명']
@@ -329,13 +301,9 @@ class RoadDataPreprocessor:
             data_frames.append(logger2_df)
             print(f"데이터로거 1368: {len(logger2_df)} rows")
         
-        # 모든 데이터 통합
         combined_df = pd.concat(data_frames, ignore_index=True)
         
-        # 일시 변환
         combined_df['일시'] = pd.to_datetime(combined_df['일시'], errors='coerce')
-        
-        # 기온, 습도를 숫자로 변환
         combined_df['기온'] = pd.to_numeric(combined_df['기온'], errors='coerce')
         combined_df['습도'] = pd.to_numeric(combined_df['습도'], errors='coerce')
         
@@ -353,32 +321,26 @@ class RoadDataPreprocessor:
         
         initial_rows = len(df)
         
-        # 결측치 확인
         print("\n결측치 현황:")
         print(df.isnull().sum())
         
-        # 일시가 없는 행 제거
         df = df.dropna(subset=['일시'])
         
-        # 기온 이상치 처리 (-20°C ~ 50°C 범위)
         print(f"\n기온 범위: {df['기온'].min():.1f}°C ~ {df['기온'].max():.1f}°C")
         df.loc[(df['기온'] < -20) | (df['기온'] > 50), '기온'] = np.nan
         
-        # 습도 이상치 처리 (0% ~ 100% 범위)
         if '습도' in df.columns:
             valid_humidity = df['습도'].notna()
             if valid_humidity.sum() > 0:
                 print(f"습도 범위: {df.loc[valid_humidity, '습도'].min():.1f}% ~ {df.loc[valid_humidity, '습도'].max():.1f}%")
             df.loc[(df['습도'] < 0) | (df['습도'] > 100), '습도'] = np.nan
         
-        # 지점별로 결측치 보간
         for location in df['지점명'].unique():
             mask = df['지점명'] == location
             df.loc[mask, '기온'] = df.loc[mask, '기온'].interpolate(method='linear', limit=3)
             if '습도' in df.columns:
                 df.loc[mask, '습도'] = df.loc[mask, '습도'].interpolate(method='linear', limit=3)
         
-        # 여전히 결측치가 있는 행 제거
         df = df.dropna(subset=['기온'])
         
         print(f"\n처리 완료: {initial_rows} -> {len(df)} rows ({initial_rows - len(df)} rows 제거)")
@@ -397,7 +359,6 @@ class RoadDataPreprocessor:
         df['계절'] = df['월'].apply(lambda x: (x % 12 + 3) // 3)
         df['계절명'] = df['계절'].map({1: '봄', 2: '여름', 3: '가을', 4: '겨울'})
         
-        # 주기성을 위한 sin/cos 변환
         df['시간_sin'] = np.sin(2 * np.pi * df['시간'] / 24)
         df['시간_cos'] = np.cos(2 * np.pi * df['시간'] / 24)
         df['월_sin'] = np.sin(2 * np.pi * df['월'] / 12)
@@ -413,17 +374,12 @@ class RoadDataPreprocessor:
         print("8. 도로 데이터에 기상 패턴 매핑")
         print("=" * 80)
         
-        # 습도 결측치 채우기
         road_df['습도_filled'] = road_df['습도'].fillna(road_df['습도'].mean())
-        
-        # 각 도로 데이터 행에 대해 가장 유사한 기상 패턴 찾기
         road_df['기상패턴'] = 0
         
-        # 계절별로 처리
         for season_name in ['봄', '여름', '가을', '겨울']:
             season_mask = road_df['계절명'] == season_name
             
-            # 해당 계절 데이터가 없으면 건너뛰기
             if season_mask.sum() == 0:
                 print(f"{season_name}: 데이터 없음 (건너뜀)")
                 continue
@@ -435,37 +391,29 @@ class RoadDataPreprocessor:
             kmeans = seasonal_clustering.seasonal_kmeans[season_name]
             scaler = seasonal_clustering.seasonal_scalers[season_name]
             
-            # 도로 데이터의 기상 특성 추출 (태양광 데이터와 동일한 특성 사용)
-            # 없는 특성은 0으로 채움
             season_road_data = road_df.loc[season_mask].copy()
             
-            # 배열 크기 확인
             n_samples = len(season_road_data)
             if n_samples == 0:
                 print(f"{season_name}: 필터링 후 데이터 없음 (건너뜀)")
                 continue
             
             features_for_clustering = np.zeros((n_samples, 6))
-            features_for_clustering[:, 0] = season_road_data['기온'].values  # 기온
-            features_for_clustering[:, 1] = 0  # 강우량 (도로 데이터에 없음)
-            features_for_clustering[:, 2] = season_road_data['습도_filled'].values  # 습도
-            features_for_clustering[:, 3] = 0  # 적설량 (도로 데이터에 없음)
-            features_for_clustering[:, 4] = 0  # 풍속 (도로 데이터에 없음)
-            features_for_clustering[:, 5] = 0  # 적운량 (도로 데이터에 없음)
+            features_for_clustering[:, 0] = season_road_data['기온'].values
+            features_for_clustering[:, 1] = 0
+            features_for_clustering[:, 2] = season_road_data['습도_filled'].values
+            features_for_clustering[:, 3] = 0
+            features_for_clustering[:, 4] = 0
+            features_for_clustering[:, 5] = 0
             
-            # NaN 값 확인 및 처리
             if np.isnan(features_for_clustering).any():
                 print(f"{season_name}: NaN 값 발견, 0으로 대체")
                 features_for_clustering = np.nan_to_num(features_for_clustering, nan=0.0)
             
             try:
-                # 정규화
                 X_scaled = scaler.transform(features_for_clustering)
-                
-                # 클러스터 예측
                 cluster_labels = kmeans.predict(X_scaled)
                 
-                # 계절별 고유 레이블 생성
                 season_num = {'봄': 1, '여름': 2, '가을': 3, '겨울': 4}[season_name]
                 unique_labels = season_num * 10 + cluster_labels
                 
@@ -475,7 +423,6 @@ class RoadDataPreprocessor:
                 
             except Exception as e:
                 print(f"{season_name}: 패턴 매핑 중 오류 발생 - {str(e)}")
-                # 오류 발생 시 해당 계절 데이터는 기본값(0) 유지
                 continue
         
         print(f"\n도로 데이터 기상패턴 분포:")
@@ -485,7 +432,6 @@ class RoadDataPreprocessor:
         else:
             print("매핑된 패턴이 없습니다.")
         
-        # 패턴이 할당되지 않은 데이터 확인
         unassigned = (road_df['기상패턴'] == 0).sum()
         if unassigned > 0:
             print(f"\n경고: {unassigned}개 데이터가 기상패턴이 할당되지 않았습니다.")
@@ -495,76 +441,91 @@ class RoadDataPreprocessor:
 
 class LSTM_Pattern(nn.Module):
     """
-    패턴 정보를 활용한 LSTM 모델
+    과적합 방지가 강화된 LSTM 모델
+    - Dropout 비율 증가
+    - Layer Normalization 추가
+    - Weight Decay 적용
     """
     def __init__(self, weather_feature_dim=4, pattern_embedding_dim=16, hidden_dim=64, num_layers=2, n_patterns=50):
         super(LSTM_Pattern, self).__init__()
         
         self.n_patterns = n_patterns
+        self.hidden_dim = hidden_dim
         
-        # Pattern Embedding Layer (계절별 5개 클러스터 * 4계절 = 최대 40개 + 여유)
+        # Pattern Embedding with Dropout
         self.pattern_embed = nn.Embedding(n_patterns, pattern_embedding_dim)
+        self.embedding_dropout = nn.Dropout(0.3)
         
-        # LSTM (기상 데이터 + 패턴 임베딩)
+        # LSTM with increased dropout
         lstm_input_size = weather_feature_dim + pattern_embedding_dim
         self.lstm = nn.LSTM(input_size=lstm_input_size, hidden_size=hidden_dim, 
-                              num_layers=num_layers, batch_first=True, dropout=0.2)
+                              num_layers=num_layers, batch_first=True, dropout=0.4)
+        
+        # Layer Normalization
+        self.layer_norm = nn.LayerNorm(hidden_dim)
         
         # Attention mechanism
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, 
+                                              batch_first=True, dropout=0.3)
         
-        # FC layers
+        # FC layers with stronger regularization
         self.fc1 = nn.Linear(hidden_dim, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, 1)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout1 = nn.Dropout(0.5)  # 증가된 dropout
+        self.dropout2 = nn.Dropout(0.4)
         self.batch_norm1 = nn.BatchNorm1d(128)
         self.batch_norm2 = nn.BatchNorm1d(64)
 
     def forward(self, x):
         batch_size, seq_len, total_features = x.shape
         
-        # 기상 데이터와 패턴 데이터 분리
-        weather_data = x[:, :, :4]  # 기온, 습도, 시간_sin, 시간_cos
-        pattern_data = x[:, :, 4].long()  # 패턴 레이블
+        weather_data = x[:, :, :4]
+        pattern_data = x[:, :, 4].long()
         
-        # Pattern이 범위를 벗어나면 0으로 클리핑
         pattern_data = torch.clamp(pattern_data, 0, self.n_patterns - 1)
         
-        # Pattern embedding
+        # Pattern embedding with dropout
         pattern_emb = self.pattern_embed(pattern_data)
+        pattern_emb = self.embedding_dropout(pattern_emb)
         
-        # Combine weather data with pattern embedding
         combined_features = torch.cat([weather_data, pattern_emb], dim=2)
         
         # LSTM
         lstm_out, (h_n, c_n) = self.lstm(combined_features)
         
+        # Layer Normalization
+        lstm_out = self.layer_norm(lstm_out)
+        
         # Self-attention
         attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
         
-        # Use last hidden state
         out = attn_out[:, -1, :]
         
-        # FC layers with batch normalization
+        # FC layers with strong regularization
         out = self.fc1(out)
         out = self.batch_norm1(out)
         out = F.relu(out)
-        out = self.dropout(out)
+        out = self.dropout1(out)
         
         out = self.fc2(out)
         out = self.batch_norm2(out)
         out = F.relu(out)
-        out = self.dropout(out)
+        out = self.dropout2(out)
         
         out = self.fc3(out)
         return out.squeeze()
     
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.001):
-        """모델 학습 함수"""
+    def train_model(self, train_loader, val_loader=None, epochs=100, lr=0.0005):
+        """모델 학습 함수 (개선된 조기 종료)"""
         criterion = nn.MSELoss()
-        optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        # Weight decay 추가
+        optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-3)
+        
+        # ReduceLROnPlateau 스케줄러 사용
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
         
         train_losses = []
         val_losses = []
@@ -573,8 +534,9 @@ class LSTM_Pattern(nn.Module):
         start_time = time.time()
         
         best_val_loss = float('inf')
-        patience = 10
+        patience = 15  # 증가된 patience
         patience_counter = 0
+        best_model_state = None
         
         for epoch in range(epochs):
             epoch_start_time = time.time()
@@ -590,7 +552,8 @@ class LSTM_Pattern(nn.Module):
                 loss = criterion(preds, batch_y)
                 loss.backward()
                 
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
                 
                 optimizer.step()
                 train_loss += loss.item()
@@ -613,28 +576,36 @@ class LSTM_Pattern(nn.Module):
                 avg_val_loss = val_loss / len(val_loader)
                 val_losses.append(avg_val_loss)
                 
+                # Learning rate scheduling
+                scheduler.step(avg_val_loss)
+                
+                # Early stopping with best model saving
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     patience_counter = 0
+                    best_model_state = self.state_dict().copy()
                 else:
                     patience_counter += 1
                 
                 if patience_counter >= patience:
                     print(f"Early stopping at epoch {epoch+1}")
+                    # Load best model
+                    if best_model_state is not None:
+                        self.load_state_dict(best_model_state)
                     break
                 
-                scheduler.step()
-                
-                if (epoch + 1) % 5 == 0 or epoch == 0:
+                if (epoch + 1) % 10 == 0 or epoch == 0:
                     epoch_time = time.time() - epoch_start_time
+                    current_lr = optimizer.param_groups[0]['lr']
                     print(f"Epoch [{epoch+1:3d}/{epochs}] | "
                           f"Train Loss: {avg_train_loss:.4f} | "
                           f"Val Loss: {avg_val_loss:.4f} | "
-                          f"LR: {scheduler.get_last_lr()[0]:.6f} | "
+                          f"LR: {current_lr:.6f} | "
                           f"시간: {epoch_time:.1f}s")
         
         total_time = time.time() - start_time
         print(f"\n학습 완료! 총 소요시간: {total_time/60:.1f}분")
+        print(f"Best Validation Loss: {best_val_loss:.4f}")
         
         return train_losses, val_losses
     
@@ -665,25 +636,31 @@ class LSTM_Pattern(nn.Module):
 
 class GRU_Pattern(nn.Module):
     """
-    패턴 정보를 활용한 GRU 모델
+    과적합 방지가 강화된 GRU 모델
     """
     def __init__(self, weather_feature_dim=4, pattern_embedding_dim=16, hidden_dim=64, num_layers=2, n_patterns=50):
         super(GRU_Pattern, self).__init__()
         
         self.n_patterns = n_patterns
+        self.hidden_dim = hidden_dim
         
         self.pattern_embed = nn.Embedding(n_patterns, pattern_embedding_dim)
+        self.embedding_dropout = nn.Dropout(0.3)
         
         gru_input_size = weather_feature_dim + pattern_embedding_dim
         self.gru = nn.GRU(input_size=gru_input_size, hidden_size=hidden_dim, 
-                            num_layers=num_layers, batch_first=True, dropout=0.2)
+                            num_layers=num_layers, batch_first=True, dropout=0.4)
         
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, 
+                                              batch_first=True, dropout=0.3)
         
         self.fc1 = nn.Linear(hidden_dim, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, 1)
-        self.dropout = nn.Dropout(0.3)
+        self.dropout1 = nn.Dropout(0.5)
+        self.dropout2 = nn.Dropout(0.4)
         self.batch_norm1 = nn.BatchNorm1d(128)
         self.batch_norm2 = nn.BatchNorm1d(64)
 
@@ -696,10 +673,13 @@ class GRU_Pattern(nn.Module):
         pattern_data = torch.clamp(pattern_data, 0, self.n_patterns - 1)
         
         pattern_emb = self.pattern_embed(pattern_data)
+        pattern_emb = self.embedding_dropout(pattern_emb)
         
         combined_features = torch.cat([weather_data, pattern_emb], dim=2)
         
         gru_out, h_n = self.gru(combined_features)
+        
+        gru_out = self.layer_norm(gru_out)
         
         attn_out, _ = self.attention(gru_out, gru_out, gru_out)
         
@@ -708,21 +688,24 @@ class GRU_Pattern(nn.Module):
         out = self.fc1(out)
         out = self.batch_norm1(out)
         out = F.relu(out)
-        out = self.dropout(out)
+        out = self.dropout1(out)
         
         out = self.fc2(out)
         out = self.batch_norm2(out)
         out = F.relu(out)
-        out = self.dropout(out)
+        out = self.dropout2(out)
         
         out = self.fc3(out)
         return out.squeeze()
     
-    def train_model(self, train_loader, val_loader=None, epochs=10, lr=0.001):
+    def train_model(self, train_loader, val_loader=None, epochs=100, lr=0.0005):
         """모델 학습 함수"""
         criterion = nn.MSELoss()
-        optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        optimizer = optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-3)
+        
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
         
         train_losses = []
         val_losses = []
@@ -731,8 +714,9 @@ class GRU_Pattern(nn.Module):
         start_time = time.time()
         
         best_val_loss = float('inf')
-        patience = 10
+        patience = 15
         patience_counter = 0
+        best_model_state = None
         
         for epoch in range(epochs):
             epoch_start_time = time.time()
@@ -747,7 +731,7 @@ class GRU_Pattern(nn.Module):
                 loss = criterion(preds, batch_y)
                 loss.backward()
                 
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.5)
                 
                 optimizer.step()
                 train_loss += loss.item()
@@ -769,28 +753,33 @@ class GRU_Pattern(nn.Module):
                 avg_val_loss = val_loss / len(val_loader)
                 val_losses.append(avg_val_loss)
                 
+                scheduler.step(avg_val_loss)
+                
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     patience_counter = 0
+                    best_model_state = self.state_dict().copy()
                 else:
                     patience_counter += 1
                 
                 if patience_counter >= patience:
                     print(f"Early stopping at epoch {epoch+1}")
+                    if best_model_state is not None:
+                        self.load_state_dict(best_model_state)
                     break
                 
-                scheduler.step()
-                
-                if (epoch + 1) % 5 == 0 or epoch == 0:
+                if (epoch + 1) % 10 == 0 or epoch == 0:
                     epoch_time = time.time() - epoch_start_time
+                    current_lr = optimizer.param_groups[0]['lr']
                     print(f"Epoch [{epoch+1:3d}/{epochs}] | "
                           f"Train Loss: {avg_train_loss:.4f} | "
                           f"Val Loss: {avg_val_loss:.4f} | "
-                          f"LR: {scheduler.get_last_lr()[0]:.6f} | "
+                          f"LR: {current_lr:.6f} | "
                           f"시간: {epoch_time:.1f}s")
         
         total_time = time.time() - start_time
         print(f"\n학습 완료! 총 소요시간: {total_time/60:.1f}분")
+        print(f"Best Validation Loss: {best_val_loss:.4f}")
         
         return train_losses, val_losses
     
@@ -902,12 +891,11 @@ class TimeSeriesDataGenerator:
 
 def train_xgboost_stacking(base_predictions_train, y_train, base_predictions_val, y_val, 
                            base_predictions_test, y_test, X_train_features, X_val_features, X_test_features):
-    """XGBoost 스태킹 모델 학습 및 평가 (개선 버전)"""
+    """XGBoost 스태킹 모델 학습 및 평가 (과적합 방지 강화)"""
     print("\n" + "=" * 80)
-    print("12. XGBoost 스태킹 모델 학습 (개선)")
+    print("12. XGBoost 스태킹 모델 학습 (과적합 방지 강화)")
     print("=" * 80)
     
-    # 기본 모델의 예측값 + 원본 특성 결합
     print("\n특성 결합 중...")
     train_features = np.column_stack([base_predictions_train, X_train_features])
     val_features = np.column_stack([base_predictions_val, X_val_features])
@@ -917,21 +905,21 @@ def train_xgboost_stacking(base_predictions_train, y_train, base_predictions_val
     print(f"Val features shape: {val_features.shape}")
     print(f"Test features shape: {test_features.shape}")
     
-    # XGBoost 하이퍼파라미터 최적화
+    # XGBoost 하이퍼파라미터 - 과적합 방지 강화
     xgb_model = xgb.XGBRegressor(
-        n_estimators=200,           # 적당한 트리 수
-        learning_rate=0.05,         # 낮은 학습률로 안정성 확보
-        max_depth=4,                # 깊이 제한으로 과적합 방지
-        min_child_weight=5,         # 리프 노드 최소 샘플 수 증가
-        subsample=0.8,              # 샘플 서브샘플링
-        colsample_bytree=0.8,       # 특성 서브샘플링
-        gamma=0.1,                  # 분할 최소 손실 감소
-        reg_alpha=0.05,             # L1 정규화
-        reg_lambda=1.0,             # L2 정규화
+        n_estimators=300,           # 트리 수 증가
+        learning_rate=0.03,         # 더 낮은 학습률
+        max_depth=3,                # 더 얕은 깊이
+        min_child_weight=10,        # 리프 노드 최소 샘플 수 증가
+        subsample=0.7,              # 낮은 샘플 서브샘플링
+        colsample_bytree=0.7,       # 낮은 특성 서브샘플링
+        gamma=0.2,                  # 높은 분할 최소 손실 감소
+        reg_alpha=0.1,              # 강한 L1 정규화
+        reg_lambda=2.0,             # 강한 L2 정규화
         random_state=42,
         objective='reg:squarederror',
-        early_stopping_rounds=20,   # early_stopping_rounds를 여기로 이동
-        enable_categorical=False    # 범주형 특성 비활성화
+        early_stopping_rounds=30,
+        enable_categorical=False
     )
     
     print("\nXGBoost 학습 중...")
@@ -970,14 +958,30 @@ def train_xgboost_stacking(base_predictions_train, y_train, base_predictions_val
     print(f"{'Val':<10} {val_nmae:<10.4f} {val_r2:<10.4f} {val_mape:<12.2f} {val_acc:>15.2f}")
     print(f"{'Test':<10} {test_nmae:<10.4f} {test_r2:<10.4f} {test_mape:<12.2f} {test_acc:>15.2f}")
     
+    # 과적합 체크
+    print("\n=== 과적합 체크 ===")
+    r2_diff = train_r2 - test_r2
+    if r2_diff < 0.1:
+        print(f"✓ 과적합 없음: Train R² ({train_r2:.4f}) - Test R² ({test_r2:.4f}) = {r2_diff:.4f}")
+    elif r2_diff < 0.2:
+        print(f"⚠ 경미한 과적합: Train R² ({train_r2:.4f}) - Test R² ({test_r2:.4f}) = {r2_diff:.4f}")
+    else:
+        print(f"✗ 과적합 발생: Train R² ({train_r2:.4f}) - Test R² ({test_r2:.4f}) = {r2_diff:.4f}")
+    
     # KPI 체크
     print("\n=== KPI 체크 ===")
     kpi_threshold = 90.0
+    r2_threshold = 0.8
+    
     if test_acc >= kpi_threshold:
-        print(f"✓ KPI 달성: 도로별 열위험도 예측 정확도 {test_acc:.2f}% (목표: {kpi_threshold}% 이상)")
+        print(f"✓ 정확도 KPI 달성: {test_acc:.2f}% (목표: {kpi_threshold}% 이상)")
     else:
-        print(f"✗ KPI 미달: 도로별 열위험도 예측 정확도 {test_acc:.2f}% (목표: {kpi_threshold}% 이상)")
-        print(f"  개선 필요: {kpi_threshold - test_acc:.2f}%p 부족")
+        print(f"✗ 정확도 KPI 미달: {test_acc:.2f}% (목표: {kpi_threshold}% 이상)")
+    
+    if test_r2 >= r2_threshold:
+        print(f"✓ R² KPI 달성: {test_r2:.4f} (목표: {r2_threshold} 이상)")
+    else:
+        print(f"✗ R² KPI 미달: {test_r2:.4f} (목표: {r2_threshold} 이상)")
     
     # 특성 중요도
     feature_names = ['LSTM_예측값', 'GRU_예측값'] + [f'원본특성_{i+1}' for i in range(train_features.shape[1] - 2)]
@@ -995,7 +999,7 @@ def train_xgboost_stacking(base_predictions_train, y_train, base_predictions_val
     }
 
 def evaluate_model(y_true, y_pred, model_name):
-    """모델 성능 평가 (개선 버전)"""
+    """모델 성능 평가"""
     nmae = calculate_nmae(y_true, y_pred)
     r2 = calculate_r2(y_true, y_pred)
     mape = calculate_mape(y_true, y_pred)
@@ -1020,7 +1024,7 @@ def main():
     
     print("\n")
     print("=" * 80)
-    print("계절별 기상 패턴 클러스터링 기반 도로 열위험도 예측 시스템")
+    print("계절별 기상 패턴 클러스터링 기반 도로 열위험도 예측 시스템 (과적합 방지)")
     print("=" * 80)
     
     # 1. 태양광 발전 데이터 로드 및 전처리
@@ -1088,18 +1092,18 @@ def main():
     X_val_scaled, _ = data_gen.normalize_features(X_val, X_val)
     
     # DataLoader 생성
+    batch_size = 64  # 더 큰 배치 사이즈로 일반화 향상
     train_dataset = TimeSeriesDataset(X_train_scaled, y_train)
     val_dataset = TimeSeriesDataset(X_val_scaled, y_val)
     test_dataset = TimeSeriesDataset(X_test_scaled, y_test)
     
-    batch_size = 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     # 7. LSTM_Pattern 모델 학습
     print("\n" + "=" * 80)
-    print("11-1. LSTM_Pattern 모델 학습")
+    print("11-1. LSTM_Pattern 모델 학습 ")
     print("=" * 80)
     
     lstm_model = LSTM_Pattern(
@@ -1111,7 +1115,7 @@ def main():
     ).to(device)
     
     lstm_train_losses, lstm_val_losses = lstm_model.train_model(
-        train_loader, val_loader, epochs=50, lr=0.001
+        train_loader, val_loader, epochs=100, lr=0.0005
     )
     
     lstm_pred_train, _ = lstm_model.predict(train_loader)
@@ -1134,7 +1138,7 @@ def main():
     ).to(device)
     
     gru_train_losses, gru_val_losses = gru_model.train_model(
-        train_loader, val_loader, epochs=50, lr=0.001
+        train_loader, val_loader, epochs=100, lr=0.0005
     )
     
     gru_pred_train, _ = gru_model.predict(train_loader)
@@ -1144,8 +1148,7 @@ def main():
     gru_results = evaluate_model(y_test, gru_pred_test, "GRU_Pattern")
     
     # 9. XGBoost 스태킹용 추가 특성 준비
-    # 마지막 타임스텝의 특성 사용
-    X_train_last = X_train_scaled[:, -1, :4]  # 기온, 습도, 시간_sin, 시간_cos
+    X_train_last = X_train_scaled[:, -1, :4]
     X_val_last = X_val_scaled[:, -1, :4]
     X_test_last = X_test_scaled[:, -1, :4]
     
@@ -1153,7 +1156,7 @@ def main():
     base_predictions_val = np.column_stack([lstm_pred_val, gru_pred_val])
     base_predictions_test = np.column_stack([lstm_pred_test, gru_pred_test])
     
-    # 10. XGBoost 스태킹 (개선)
+    # 10. XGBoost 스태킹
     xgb_model, xgb_pred_test, xgb_results = train_xgboost_stacking(
         base_predictions_train, y_train,
         base_predictions_val, y_val,
@@ -1171,7 +1174,7 @@ def main():
           f"{lstm_results['MAPE']:<12.2f} {lstm_results['Accuracy']:>15.2f}")
     print(f"{'GRU_Pattern':<30} {gru_results['NMAE']:<12.4f} {gru_results['R2']:<12.4f} "
           f"{gru_results['MAPE']:<12.2f} {gru_results['Accuracy']:>15.2f}")
-    print(f"{'XGBoost Stacking (개선)':<30} {xgb_results['NMAE']:<12.4f} {xgb_results['R2']:<12.4f} "
+    print(f"{'XGBoost Stacking':<30} {xgb_results['NMAE']:<12.4f} {xgb_results['R2']:<12.4f} "
           f"{xgb_results['MAPE']:<12.2f} {xgb_results['Accuracy']:>15.2f}")
     
     # KPI 최종 확인
@@ -1179,30 +1182,37 @@ def main():
     print("14. KPI 최종 확인")
     print("=" * 80)
     kpi_target = 90.0
+    r2_target = 0.8
+    
     best_model = max(
-        [('LSTM_Pattern', lstm_results['Accuracy']),
-         ('GRU_Pattern', gru_results['Accuracy']),
-         ('XGBoost Stacking', xgb_results['Accuracy'])],
-        key=lambda x: x[1]
+        [('LSTM_Pattern', lstm_results['Accuracy'], lstm_results['R2']),
+         ('GRU_Pattern', gru_results['Accuracy'], gru_results['R2']),
+         ('XGBoost Stacking', xgb_results['Accuracy'], xgb_results['R2'])],
+        key=lambda x: (x[1], x[2])
     )
     
-    print(f"\n최고 성능 모델: {best_model[0]} ({best_model[1]:.2f}%)")
-    if best_model[1] >= kpi_target:
-        print(f"✓ 전체 KPI 달성: {best_model[1]:.2f}% ≥ {kpi_target}%")
+    print(f"\n최고 성능 모델: {best_model[0]}")
+    print(f"  Accuracy: {best_model[1]:.2f}%")
+    print(f"  R²: {best_model[2]:.4f}")
+    
+    if best_model[1] >= kpi_target and best_model[2] >= r2_target:
+        print(f"✓ 전체 KPI 달성!")
     else:
-        print(f"✗ 전체 KPI 미달: {best_model[1]:.2f}% < {kpi_target}%")
-        print(f"  개선 필요: {kpi_target - best_model[1]:.2f}%p")
+        if best_model[1] < kpi_target:
+            print(f"✗ 정확도 미달: {kpi_target - best_model[1]:.2f}%p 부족")
+        if best_model[2] < r2_target:
+            print(f"✗ R² 미달: {r2_target - best_model[2]:.4f} 부족")
     
     # 12. 모델 저장
     print("\n" + "=" * 80)
     print("15. 모델 저장")
     print("=" * 80)
     
-    torch.save(lstm_model.state_dict(), './heatmap_prediction/lstm_pattern_seasonal_model.pth')
-    torch.save(gru_model.state_dict(), './heatmap_prediction/gru_pattern_seasonal_model.pth')
+    torch.save(lstm_model.state_dict(), './heatmap_prediction/lstm_pattern_improved.pth')
+    torch.save(gru_model.state_dict(), './heatmap_prediction/gru_pattern_improved.pth')
     print("\n모델 저장 완료:")
-    print("- ./heatmap_prediction/lstm_pattern_seasonal_model.pth")
-    print("- ./heatmap_prediction/gru_pattern_seasonal_model.pth")
+    print("- ./heatmap_prediction/lstm_pattern_improved.pth")
+    print("- ./heatmap_prediction/gru_pattern_improved.pth")
     
     print("\n" + "=" * 80)
     print("분석 완료!")
